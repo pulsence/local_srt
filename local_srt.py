@@ -17,20 +17,21 @@ from faster_whisper import WhisperModel
 # Audio conversion
 # -----------------------------
 def to_wav_16k_mono(input_path: str, wav_path: str):
-    subprocess.check_call(
-    [
-        "ffmpeg",
-        "-y",
-        "-loglevel", "error",   # or "quiet"
+    cmd = [
+        "ffmpeg", "-y",
+        "-loglevel", "error",
         "-i", input_path,
         "-ac", "1",
         "-ar", "16000",
         "-vn",
         wav_path,
-    ],
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
-)
+    ]
+
+    p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if p.returncode != 0:
+        # include last ~20 lines to avoid huge dumps
+        tail = "\n".join((p.stderr or "").splitlines()[-20:])
+        raise subprocess.CalledProcessError(p.returncode, cmd, output=None, stderr=tail)
 
 # -----------------------------
 # SRT formatting
@@ -52,7 +53,7 @@ class SubtitleBlock:
     lines: List[str]  # 1–2 lines
 
 # -----------------------------
-# Loging helpers
+# Logging helpers
 # -----------------------------
 def log(msg: str, *, quiet: bool = False):
     if not quiet:
@@ -80,6 +81,21 @@ def format_duration(seconds: float) -> str:
         return f"{h:d}:{m:02d}:{s:02d}"
     return f"{m:d}:{s:02d}"
 
+def probe_duration_seconds(path: str) -> float | None:
+    if shutil.which("ffprobe") is None:
+        return None
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path
+    ]
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    try:
+        return float(p.stdout.strip())
+    except Exception:
+        return None
+
 # -----------------------------
 # Validation helpers
 # -----------------------------
@@ -93,11 +109,13 @@ def ensure_parent_dir(path: Path) -> None:
     if parent and not parent.exists():
         parent.mkdir(parents=True, exist_ok=True)
 
-def preflight_checks(input_path: Path, output_path: Path) -> Tuple[bool, str]:
+def preflight_checks(input_path: Path, output_path: Path, overwrite: bool) -> Tuple[bool, str]:
     if not input_path.exists():
         return False, f"Input file not found: {input_path}"
     if input_path.is_dir():
         return False, f"Input path is a directory, expected a media file: {input_path}"
+    if output_path.exists() and not overwrite:
+        return False, f"Output already exists: {output_path} (use --overwrite)"
     if output_path.exists() and output_path.is_dir():
         return False, f"Output path is a directory, expected a file: {output_path}"
     return True, ""
@@ -440,7 +458,7 @@ def main():
     ap.add_argument("input", help="Path to audio/video file")
     ap.add_argument("-o", "--output", default="output.srt", help="Output SRT path")
     ap.add_argument("--model", default="small", help="tiny/base/small/medium/large-v3")
-    ap.add_argument("--device", default="cpu", help="cpu or cuda")
+    ap.add_argument("--device", choices=["cpu", "cuda"], default="cpu", help="cpu or cuda")
     ap.add_argument("--language", default=None, help="Optional language code (e.g., en). If omitted, auto-detect.")
     ap.add_argument("--max_chars", type=int, default=None, help="Max characters per subtitle line")
     ap.add_argument("--max_lines", type=int, default=None, help="Max lines per subtitle block")
@@ -460,6 +478,9 @@ def main():
     )
     ap.add_argument("--quiet", action="store_true", help="Suppress non-error output")
     ap.add_argument("--no-progress", action="store_true", help="Disable progress output")
+    ap.add_argument("--debug", action="store_true", help="Print full traceback on errors")
+    ap.add_argument("--overwrite", action="store_true", help="Overwrite output if it exists")
+    ap.add_argument("--tmpdir", default=None, help="Directory for temporary WAV (defaults to system temp)")
     args = ap.parse_args()
 
     PRESETS = {
@@ -549,7 +570,7 @@ def main():
     input_path = Path(args.input)
     output_path = Path(args.output)
 
-    ok, reason = preflight_checks(input_path, output_path)
+    ok, reason = preflight_checks(input_path, output_path, args.overwrite)
     if not ok:
         return die(reason, code=2)
 
@@ -562,7 +583,8 @@ def main():
     if shutil.which("ffmpeg") is None:
         return die("ffmpeg not found on PATH. Install it or add it to PATH.", code=2)
 
-    fd, tmp_wav = tempfile.mkstemp(prefix="srtgen_", suffix=".wav")
+    tmpdir = args.tmpdir if args.tmpdir else None
+    fd, tmp_wav = tempfile.mkstemp(prefix="srtgen_", suffix=".wav", dir=tmpdir)
     os.close(fd)
 
     started = time.time()
@@ -587,10 +609,19 @@ def main():
         )
 
         seg_list = []
+        dur_total = probe_duration_seconds(str(tmp_wav))
+        last_ratio = 0.0
         for idx, seg in enumerate(segments_iter, start=1):
             seg_list.append(seg)
+            pct = ""
+            if dur_total and dur_total > 0:
+                ratio = seg.end / dur_total
+                ratio = max(last_ratio, ratio)
+                ratio = min(1.0, ratio)
+                last_ratio = ratio
+                pct = f"{ratio * 100:5.1f}%"
             progress_line(
-                f"   segments: {idx} | t={format_duration(seg.end)}",
+                f"   {pct} segments: {idx} | t={format_duration(seg.end)}",
                 enabled=show_progress,
                 quiet=quiet
             )
@@ -626,15 +657,17 @@ def main():
         return die(str(e), code=2)
 
     except subprocess.CalledProcessError as e:
-        # Common: ffmpeg failure on decoding file
-        return die(f"ffmpeg failed (exit {e.returncode}). Is the input a valid audio/video file?", code=2)
+        detail = f"\nffmpeg stderr (tail):\n{e.stderr}" if getattr(e, "stderr", None) else ""
+        return die(f"ffmpeg failed (exit {e.returncode}). Is the input a valid audio/video file?{detail}", code=2)
+
 
     except KeyboardInterrupt:
         return die("Interrupted by user.", code=130)
 
     except Exception as e:
         # Unexpected failure
-        # If you want full trace for debugging, you can add a --debug flag later
+        if args.debug:
+            traceback.print_exc()
         return die(f"Unhandled error: {e}", code=1)
 
     finally:
