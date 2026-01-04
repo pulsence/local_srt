@@ -1,2 +1,7 @@
 # Ignore all mp3 files
 *.mp3
+*.mp4
+*.wav
+*.srt
+*.code-workspace
+
