@@ -7,7 +7,6 @@ from typing import List, Tuple
 
 from faster_whisper import WhisperModel
 
-
 # -----------------------------
 # Audio conversion
 # -----------------------------
@@ -27,8 +26,6 @@ def to_wav_16k_mono(input_path: str, wav_path: str):
     stderr=subprocess.DEVNULL,
 )
 
-
-
 # -----------------------------
 # SRT formatting
 # -----------------------------
@@ -42,13 +39,11 @@ def format_srt_time(seconds: float) -> str:
     ms %= 1000
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-
 @dataclass
 class SubtitleBlock:
     start: float
     end: float
     lines: List[str]  # 1–2 lines
-
 
 # -----------------------------
 # Chunking rules
@@ -58,11 +53,9 @@ def normalize_spaces(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-
 def wrap_text_lines(text: str, max_chars_per_line: int) -> List[str]:
     """
-    Greedy word wrap into as many lines as needed.
-    NEVER drops words.
+    Greedy word wrap into as many lines as needed. Never drops words.
     """
     text = normalize_spaces(text)
     if not text:
@@ -91,7 +84,118 @@ def wrap_text_lines(text: str, max_chars_per_line: int) -> List[str]:
 
     return lines
 
+def block_fits(text: str, max_chars_per_line: int, max_lines: int) -> bool:
+    return len(wrap_text_lines(text, max_chars_per_line)) <= max_lines
 
+def wrap_fallback_blocks(text: str, max_chars_per_line: int, max_lines: int) -> List[str]:
+    """
+    Final fallback: wrap into lines then group lines into blocks of max_lines.
+    Never drops words.
+    """
+    lines = wrap_text_lines(text, max_chars_per_line)
+    blocks: List[str] = []
+    for i in range(0, len(lines), max_lines):
+        blocks.append(" ".join(lines[i:i + max_lines]))
+    return blocks
+
+def split_on_delims(text: str, delims: str) -> List[str]:
+    """
+    Split using delimiter characters as boundaries, keeping delimiter attached to
+    the preceding chunk. Uses match spans; no punctuation duplication bugs.
+    Only splits when delimiter is followed by whitespace.
+    """
+    text = normalize_spaces(text)
+    if not text:
+        return []
+
+    # Match minimal up to one-or-more delimiters, require whitespace boundary.
+    pattern = re.compile(rf".+?(?:[{re.escape(delims)}]+)(?=\s+)")
+    parts: List[str] = []
+    last_end = 0
+
+    for m in pattern.finditer(text):
+        end = m.end()
+        chunk = text[last_end:end].strip()
+        if chunk:
+            parts.append(chunk)
+
+        # advance past boundary whitespace
+        ws = re.match(r"\s+", text[end:])
+        last_end = end + (ws.end() if ws else 0)
+
+    rem = text[last_end:].strip()
+    if rem:
+        parts.append(rem)
+
+    # filter out "dangling punctuation-only" tokens (rare)
+    parts = [p for p in parts if re.search(r"\w", p)]
+    return parts
+
+def split_text_into_blocks(
+    text: str,
+    max_chars_per_line: int,
+    max_lines: int,
+    allow_commas: bool = True,
+    allow_medium: bool = True,
+    prefer_punct_splits: bool = False,
+) -> List[str]:
+    """
+    Prefer splitting on strong punctuation first, then medium, then weak,
+    and only then fall back to word-wrapping.
+
+    Guarantees: no words dropped; each returned block will fit into <= max_lines
+    when wrapped at max_chars_per_line (or will be wrapped-fallback produced).
+    """
+    text = normalize_spaces(text)
+    if not text:
+        return []
+
+    # Define punctuation tiers (descending strength)
+    tiers: List[str] = [".?!"]
+    if allow_medium:
+        tiers.append(";:")
+    if allow_commas:
+        tiers.append(",")
+
+    def refine_chunk(chunk: str, tier_index: int) -> List[str]:
+        chunk = normalize_spaces(chunk)
+        if not chunk:
+            return []
+
+        fits = block_fits(chunk, max_chars_per_line, max_lines)
+
+        # If it fits, keep as-is unless we're explicitly preferring punctuation splits
+        # at the strongest tier (tier_index == 0).
+        if fits and not (prefer_punct_splits and tier_index == 0):
+            return [chunk]
+
+        # If we've exhausted tiers, fallback to wrap
+        if tier_index >= len(tiers):
+            return wrap_fallback_blocks(chunk, max_chars_per_line, max_lines)
+
+        # Split on current tier; if no split happens, advance tier
+        parts = split_on_delims(chunk, tiers[tier_index])
+        if len(parts) <= 1:
+            return refine_chunk(chunk, tier_index + 1)
+
+        # Recurse: each part may still be too large, so refine further
+        out: List[str] = []
+        for p in parts:
+            out.extend(refine_chunk(p, tier_index + 1))
+        return out
+
+    # Start by refining the whole text from strongest tier
+    blocks = refine_chunk(text, 0)
+
+    # Final safety pass: ensure fit (should already hold)
+    safe: List[str] = []
+    for b in blocks:
+        if block_fits(b, max_chars_per_line, max_lines):
+            safe.append(b)
+        else:
+            safe.extend(wrap_fallback_blocks(b, max_chars_per_line, max_lines))
+
+    return safe
 
 def preferred_split_index(text: str) -> int:
     """
@@ -110,26 +214,6 @@ def preferred_split_index(text: str) -> int:
         return sp + 1
     return -1
 
-
-def split_text_into_blocks(text: str, max_chars_per_line: int, max_lines: int) -> List[str]:
-    """
-    Break long text into multiple block-texts that can be wrapped into <= max_lines.
-    """
-    text = normalize_spaces(text)
-    blocks: List[str] = []
-
-    # Quick accept if it fits when wrapped
-    lines = wrap_text_lines(text, max_chars_per_line)
-    if not lines:
-        return []
-    
-    blocks: List[str] = []
-    for i in range(0, len(lines), max_lines):
-        block_lines = lines[i:i + max_lines]
-        blocks.append(" ".join(block_lines))  # join preserves words; re-wrap is stable
-    return blocks
-
-
 def distribute_time(start: float, end: float, parts: List[str]) -> List[Tuple[float, float, str]]:
     """
     Split the [start,end] interval across N text parts proportionally by character count.
@@ -144,7 +228,6 @@ def distribute_time(start: float, end: float, parts: List[str]) -> List[Tuple[fl
         out.append((t, t + seg_dur, p))
         t += seg_dur
     return out
-
 
 def enforce_timing(
     blocks: List[Tuple[float, float, str]],
@@ -190,14 +273,16 @@ def enforce_timing(
 
     return final
 
-
 def chunk_segments_to_subtitles(
     segments,
     max_chars_per_line: int = 42,
     max_lines: int = 2,
     target_cps: float = 17.0,
     min_duration: float = 1.0,
-    max_duration: float = 6.0
+    max_duration: float = 6.0,
+    allow_commas: bool = True,
+    allow_medium: bool = True,
+    prefer_punct_splits: bool = False,
 ) -> List[SubtitleBlock]:
     """
     Convert whisper segments to subtitle blocks with readability constraints.
@@ -212,7 +297,7 @@ def chunk_segments_to_subtitles(
     # First, split any segment text that is too long to wrap into <= max_lines.
     split_raw: List[Tuple[float, float, str]] = []
     for s, e, txt in raw:
-        parts = split_text_into_blocks(txt, max_chars_per_line, max_lines)
+        parts = split_text_into_blocks(txt, max_chars_per_line, max_lines, allow_commas, allow_medium, prefer_punct_splits)
         if len(parts) == 1:
             split_raw.append((s, e, txt))
         else:
@@ -253,14 +338,12 @@ def chunk_segments_to_subtitles(
 
     return subs
 
-
 def write_srt(subs: List[SubtitleBlock], out_path: str):
     with open(out_path, "w", encoding="utf-8") as f:
         for i, sb in enumerate(subs, start=1):
             f.write(f"{i}\n")
             f.write(f"{format_srt_time(sb.start)} --> {format_srt_time(sb.end)}\n")
             f.write("\n".join(sb.lines).strip() + "\n\n")
-
 
 # -----------------------------
 # Main CLI
@@ -278,6 +361,10 @@ def main():
     ap.add_argument("--min_dur", type=float, default=1.0, help="Minimum subtitle duration in seconds")
     ap.add_argument("--max_dur", type=float, default=6.0, help="Maximum subtitle duration in seconds")
     ap.add_argument("--keep_wav", action="store_true", help="Do not delete temporary WAV file")
+    ap.add_argument("--no-comma-split", action="store_true", help="Do not split on commas")
+    ap.add_argument("--no-medium-split", action="store_true", help="Do not split on ';' or ':'")
+    ap.add_argument("--prefer-punct-splits", action="store_true",
+                    help="Prefer punctuation-based splits even if text already fits")
     args = ap.parse_args()
 
     tmp_wav = "tmp_16k_mono.wav"
@@ -301,6 +388,9 @@ def main():
             target_cps=args.target_cps,
             min_duration=args.min_dur,
             max_duration=args.max_dur,
+            allow_commas=not args.no_comma_split,
+            allow_medium=not args.no_medium_split,
+            prefer_punct_splits=args.prefer_punct_splits,
         )
 
         write_srt(subs, args.output)
@@ -313,7 +403,6 @@ def main():
             except OSError:
                 # If Windows file lock happens for some reason, don’t fail the whole run.
                 pass
-
 
 if __name__ == "__main__":
     main()
