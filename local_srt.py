@@ -50,6 +50,31 @@ class SubtitleBlock:
 # -----------------------------
 # Loging helpers
 # -----------------------------
+def log(msg: str, *, quiet: bool = False):
+    if not quiet:
+        print(msg, flush=True)
+
+def progress_line(msg: str, *, enabled: bool, quiet: bool):
+    if quiet or not enabled:
+        return
+    # one-line, overwritable progress indicator
+    sys.stdout.write("\r" + msg[:120].ljust(120))
+    sys.stdout.flush()
+
+def progress_done(*, enabled: bool, quiet: bool):
+    if quiet or not enabled:
+        return
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        return f"{h:d}:{m:02d}:{s:02d}"
+    return f"{m:d}:{s:02d}"
 
 # -----------------------------
 # Chunking rules
@@ -333,7 +358,7 @@ def chunk_segments_to_subtitles(
     subs: List[SubtitleBlock] = []
     for s, e, txt in density_fixed:
         txt = normalize_spaces(txt)
-        parts = split_text_into_blocks(txt, max_chars_per_line, max_lines)
+        parts = split_text_into_blocks(txt, max_chars_per_line, max_lines, allow_commas, allow_medium, prefer_punct_splits)
         timed_parts = distribute_time(s, e, parts) if len(parts) > 1 else [(s, e, txt)]
         for ps, pe, ptxt in timed_parts:
             lines = wrap_text_lines(ptxt, max_chars_per_line)
@@ -464,19 +489,43 @@ def main():
         resolved["prefer_punct_splits"] = True
 
     tmp_wav = "tmp_16k_mono.wav"
+    quiet = args.quiet
+    show_progress = not args.no_progress
+
+    started = time.time()
     try:
+        log("1/5 Converting audio with ffmpeg...", quiet=quiet)
         to_wav_16k_mono(args.input, tmp_wav)
 
+        log("2/5 Loading model...", quiet=quiet)
         compute_type = "int8" if args.device == "cpu" else "float16"
         model = WhisperModel(args.model, device=args.device, compute_type=compute_type)
 
-        segments, info = model.transcribe(
+        log("3/5 Transcribing...", quiet=quiet)
+        t0 = time.time()
+
+        segments_iter, info = model.transcribe(
             tmp_wav,
             vad_filter=True,
             language=args.language
         )
 
-        seg_list = list(segments)
+        # Materialize generator so we can show progress and then reuse list
+        seg_list = []
+        for idx, seg in enumerate(segments_iter, start=1):
+            seg_list.append(seg)
+            # We can show running count and latest timestamp
+            progress_line(
+                f"   segments: {idx} | t={format_duration(seg.end)}",
+                enabled=show_progress,
+                quiet=quiet
+            )
+        progress_done(enabled=show_progress, quiet=quiet)
+
+        log(f"   Transcription complete: {len(seg_list)} segments in {format_duration(time.time() - t0)}", quiet=quiet)
+
+        log("4/5 Chunking + formatting...", quiet=quiet)
+        t1 = time.time()
         subs = chunk_segments_to_subtitles(
             seg_list,
             max_chars_per_line=resolved["max_chars"],
@@ -488,16 +537,18 @@ def main():
             allow_medium=resolved["allow_medium"],
             prefer_punct_splits=resolved["prefer_punct_splits"],
         )
+        log(f"   Chunking complete: {len(subs)} subtitle blocks in {format_duration(time.time() - t1)}", quiet=quiet)
 
+        log("5/5 Writing SRT...", quiet=quiet)
         write_srt(subs, args.output)
-        print(f"Wrote: {args.output}")
+
+        log(f"Done: {args.output}  (total {format_duration(time.time() - started)})", quiet=quiet)
 
     finally:
         if not args.keep_wav and os.path.exists(tmp_wav):
             try:
                 os.remove(tmp_wav)
             except OSError:
-                # If Windows file lock happens for some reason, don’t fail the whole run.
                 pass
 
 if __name__ == "__main__":
