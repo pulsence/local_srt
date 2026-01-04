@@ -9,7 +9,7 @@ import shutil
 import traceback
 import tempfile
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Dict, Any, Optional, List, Tuple
 
 from faster_whisper import WhisperModel
 
@@ -449,22 +449,36 @@ def write_srt(subs: List[SubtitleBlock], out_path: str):
             f.write("\n".join(sb.lines).strip() + "\n\n")
 
 # -----------------------------
-# Main CLI
+# Config structures
 # -----------------------------
+@dataclass
+class ResolvedConfig:
+    max_chars: int
+    max_lines: int
+    target_cps: float
+    min_dur: float
+    max_dur: float
+    prefer_punct_splits: bool
+    allow_commas: bool
+    allow_medium: bool
 
-
-def main():
+# -----------------------------
+# CLI + config resolution
+# -----------------------------
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Local SRT generator (faster-whisper + ffmpeg)")
     ap.add_argument("input", help="Path to audio/video file")
     ap.add_argument("-o", "--output", default="output.srt", help="Output SRT path")
     ap.add_argument("--model", default="small", help="tiny/base/small/medium/large-v3")
     ap.add_argument("--device", choices=["cpu", "cuda"], default="cpu", help="cpu or cuda")
     ap.add_argument("--language", default=None, help="Optional language code (e.g., en). If omitted, auto-detect.")
+
     ap.add_argument("--max_chars", type=int, default=None, help="Max characters per subtitle line")
     ap.add_argument("--max_lines", type=int, default=None, help="Max lines per subtitle block")
     ap.add_argument("--target_cps", type=float, default=None, help="Target characters-per-second for readability")
     ap.add_argument("--min_dur", type=float, default=None, help="Minimum subtitle duration in seconds")
     ap.add_argument("--max_dur", type=float, default=None, help="Maximum subtitle duration in seconds")
+
     ap.add_argument("--keep_wav", action="store_true", help="Do not delete temporary WAV file")
     ap.add_argument("--no-comma-split", action="store_true", help="Do not split on commas")
     ap.add_argument("--no-medium-split", action="store_true", help="Do not split on ';' or ':'")
@@ -474,18 +488,18 @@ def main():
         "--mode",
         choices=["shorts", "yt", "podcast"],
         default=None,
-        help="Preset configuration: 'shorts' (short captions, faster pacing), 'yt' (standard video captions), or 'podcast' (longer captions, slower pacing)",
+        help="Preset configuration: 'shorts' (short captions, faster pacing), "
+             "'yt' (standard video captions), or 'podcast' (longer captions, slower pacing)",
     )
     ap.add_argument("--quiet", action="store_true", help="Suppress non-error output")
     ap.add_argument("--no-progress", action="store_true", help="Disable progress output")
     ap.add_argument("--debug", action="store_true", help="Print full traceback on errors")
     ap.add_argument("--overwrite", action="store_true", help="Overwrite output if it exists")
     ap.add_argument("--tmpdir", default=None, help="Directory for temporary WAV (defaults to system temp)")
-    args = ap.parse_args()
+    return ap
 
-    PRESETS = {
-        # Designed for vertical shorts: shorter lines, slightly faster pacing, and
-        # more aggressive punctuation splitting so captions feel "snappier".
+def presets() -> Dict[str, Dict[str, Any]]:
+    return {
         "shorts": {
             "max_chars": 28,
             "max_lines": 2,
@@ -493,11 +507,9 @@ def main():
             "min_dur": 0.7,
             "max_dur": 3.0,
             "prefer_punct_splits": True,
-            # In shorts, commas tend to over-fragment; default to off.
             "allow_commas": False,
             "allow_medium": True,
         },
-        # Standard YouTube video captions: comfortable line length, stable pacing.
         "yt": {
             "max_chars": 42,
             "max_lines": 2,
@@ -520,8 +532,9 @@ def main():
         },
     }
 
-    # Start with baseline defaults (equivalent to your previous defaults)
-    resolved = {
+def resolve_config(args) -> ResolvedConfig:
+    # Baseline defaults
+    cfg: Dict[str, Any] = {
         "max_chars": 42,
         "max_lines": 2,
         "target_cps": 17.0,
@@ -532,140 +545,183 @@ def main():
         "allow_medium": not args.no_medium_split,
     }
 
-    # If a mode is selected, apply its preset as the new baseline
+    # Apply preset
     if args.mode:
-        preset = PRESETS[args.mode]
-        # apply preset to resolved
-        for k, v in preset.items():
-            resolved[k] = v
+        cfg.update(presets()[args.mode])
 
-    # Now, apply user overrides (only for parameters that were passed explicitly)
-    # For numeric args, explicit means args.<name> is not None.
+    # Apply explicit numeric overrides
     if args.max_chars is not None:
-        resolved["max_chars"] = args.max_chars
+        cfg["max_chars"] = args.max_chars
     if args.max_lines is not None:
-        resolved["max_lines"] = args.max_lines
+        cfg["max_lines"] = args.max_lines
     if args.target_cps is not None:
-        resolved["target_cps"] = args.target_cps
+        cfg["target_cps"] = args.target_cps
     if args.min_dur is not None:
-        resolved["min_dur"] = args.min_dur
+        cfg["min_dur"] = args.min_dur
     if args.max_dur is not None:
-        resolved["max_dur"] = args.max_dur
+        cfg["max_dur"] = args.max_dur
 
-    # For boolean-ish punctuation flags:
-    # These are explicit by presence; your current flags already reflect explicit choices.
-    # However, when mode is set, we want the mode to control defaults unless user explicitly asked otherwise.
-    # We treat the presence of the --no-* flags as explicit overrides.
+    # Apply explicit punctuation overrides (flags mean explicit)
     if args.no_comma_split:
-        resolved["allow_commas"] = False
+        cfg["allow_commas"] = False
     if args.no_medium_split:
-        resolved["allow_medium"] = False
+        cfg["allow_medium"] = False
     if args.prefer_punct_splits:
-        resolved["prefer_punct_splits"] = True
+        cfg["prefer_punct_splits"] = True
 
-    quiet = args.quiet
-    show_progress = not args.no_progress
+    return ResolvedConfig(**cfg)
 
-    # Preflight checks
-    input_path = Path(args.input)
-    output_path = Path(args.output)
-
+# -----------------------------
+# Preflight + temp file
+# -----------------------------
+def preflight_or_die(args, input_path: Path, output_path: Path) -> Optional[int]:
     ok, reason = preflight_checks(input_path, output_path, args.overwrite)
     if not ok:
         return die(reason, code=2)
 
-    # Ensure output directory exists
     try:
         ensure_parent_dir(output_path)
     except Exception as e:
         return die(f"Could not create output directory for: {output_path} ({e})", code=2)
-    
+
     if shutil.which("ffmpeg") is None:
         return die("ffmpeg not found on PATH. Install it or add it to PATH.", code=2)
 
+    return None
+
+def make_tmp_wav(args) -> str:
     tmpdir = args.tmpdir if args.tmpdir else None
     fd, tmp_wav = tempfile.mkstemp(prefix="srtgen_", suffix=".wav", dir=tmpdir)
     os.close(fd)
+    return tmp_wav
 
-    started = time.time()
-    try:
-        log("1/5 Converting audio with ffmpeg...", quiet=quiet)
-        to_wav_16k_mono(str(input_path), tmp_wav)
+# -----------------------------
+# Pipeline
+# -----------------------------
+def transcribe_with_progress(
+    model: WhisperModel,
+    wav_path: str,
+    language: Optional[str],
+    *,
+    quiet: bool,
+    show_progress: bool,
+) -> List:
+    segments_iter, _info = model.transcribe(
+        wav_path,
+        vad_filter=True,
+        language=language,
+    )
 
-        log("2/5 Loading model...", quiet=quiet)
-        model, device_used, compute_type_used = init_whisper_model_with_fallback(
-            model_name=args.model,
-            device=args.device,
+    seg_list = []
+    dur_total = probe_duration_seconds(wav_path)
+    last_ratio = 0.0
+
+    for idx, seg in enumerate(segments_iter, start=1):
+        seg_list.append(seg)
+
+        pct = ""
+        if dur_total and dur_total > 0:
+            ratio = float(seg.end) / dur_total
+            ratio = max(last_ratio, ratio)
+            ratio = min(1.0, ratio)
+            last_ratio = ratio
+            pct = f"{ratio * 100:5.1f}%"
+
+        progress_line(
+            f"   {pct} segments: {idx} | transcription segment time={format_duration(seg.end)}",
+            enabled=show_progress,
             quiet=quiet,
         )
 
-        log("3/5 Transcribing...", quiet=quiet)
-        t0 = time.time()
+    progress_done(enabled=show_progress, quiet=quiet)
+    return seg_list
 
-        segments_iter, info = model.transcribe(
-            tmp_wav,
-            vad_filter=True,
-            language=args.language
-        )
+def run_pipeline(
+    args,
+    cfg: ResolvedConfig,
+    input_path: Path,
+    output_path: Path,
+    tmp_wav: str,
+) -> int:
+    quiet = args.quiet
+    show_progress = not args.no_progress
+    started = time.time()
 
-        seg_list = []
-        dur_total = probe_duration_seconds(str(tmp_wav))
-        last_ratio = 0.0
-        for idx, seg in enumerate(segments_iter, start=1):
-            seg_list.append(seg)
-            pct = ""
-            if dur_total and dur_total > 0:
-                ratio = seg.end / dur_total
-                ratio = max(last_ratio, ratio)
-                ratio = min(1.0, ratio)
-                last_ratio = ratio
-                pct = f"{ratio * 100:5.1f}%"
-            progress_line(
-                f"   {pct} segments: {idx} | t={format_duration(seg.end)}",
-                enabled=show_progress,
-                quiet=quiet
-            )
-        progress_done(enabled=show_progress, quiet=quiet)
+    log("1/5 Converting audio with ffmpeg...", quiet=quiet)
+    to_wav_16k_mono(str(input_path), tmp_wav)
 
-        log(f"   Transcription complete: {len(seg_list)} segments in {format_duration(time.time() - t0)}", quiet=quiet)
+    log("2/5 Loading model...", quiet=quiet)
+    model, device_used, compute_type_used = init_whisper_model_with_fallback(
+        model_name=args.model,
+        device=args.device,
+        quiet=quiet,
+    )
 
-        log("4/5 Chunking + formatting...", quiet=quiet)
-        t1 = time.time()
+    log("3/5 Transcribing...", quiet=quiet)
+    t0 = time.time()
+    seg_list = transcribe_with_progress(
+        model,
+        tmp_wav,
+        args.language,
+        quiet=quiet,
+        show_progress=show_progress,
+    )
+    log(f"   Transcription complete: {len(seg_list)} segments in {format_duration(time.time() - t0)}", quiet=quiet)
 
-        subs = chunk_segments_to_subtitles(
-            seg_list,
-            max_chars_per_line=resolved["max_chars"],
-            max_lines=resolved["max_lines"],
-            target_cps=resolved["target_cps"],
-            min_duration=resolved["min_dur"],
-            max_duration=resolved["max_dur"],
-            allow_commas=resolved["allow_commas"],
-            allow_medium=resolved["allow_medium"],
-            prefer_punct_splits=resolved["prefer_punct_splits"],
-        )
+    log("4/5 Chunking + formatting...", quiet=quiet)
+    t1 = time.time()
+    subs = chunk_segments_to_subtitles(
+        seg_list,
+        max_chars_per_line=cfg.max_chars,
+        max_lines=cfg.max_lines,
+        target_cps=cfg.target_cps,
+        min_duration=cfg.min_dur,
+        max_duration=cfg.max_dur,
+        allow_commas=cfg.allow_commas,
+        allow_medium=cfg.allow_medium,
+        prefer_punct_splits=cfg.prefer_punct_splits,
+    )
+    log(f"   Chunking complete: {len(subs)} subtitle blocks in {format_duration(time.time() - t1)}", quiet=quiet)
 
-        log(f"   Chunking complete: {len(subs)} subtitle blocks in {format_duration(time.time() - t1)}", quiet=quiet)
+    log("5/5 Writing SRT...", quiet=quiet)
+    write_srt(subs, str(output_path))
 
-        log("5/5 Writing SRT...", quiet=quiet)
-        write_srt(subs, str(output_path))
+    log(f"Done: {output_path}  (total {format_duration(time.time() - started)})", quiet=quiet)
+    return 0
 
-        log(f"Done: {output_path}  (total {format_duration(time.time() - started)})", quiet=quiet)
-        return 0
+# -----------------------------
+# Main
+# -----------------------------
+def main() -> int:
+    ap = build_parser()
+    args = ap.parse_args()
+
+    quiet = args.quiet
+
+    input_path = Path(args.input)
+    output_path = Path(args.output)
+
+    preflight_code = preflight_or_die(args, input_path, output_path)
+    if preflight_code is not None:
+        return preflight_code
+
+    cfg = resolve_config(args)
+    tmp_wav = make_tmp_wav(args)
+
+    try:
+        return run_pipeline(args, cfg, input_path, output_path, tmp_wav)
 
     except FileNotFoundError as e:
-        # Common: ffmpeg not found, or input path typo (though we preflight input)
         return die(str(e), code=2)
 
     except subprocess.CalledProcessError as e:
         detail = f"\nffmpeg stderr (tail):\n{e.stderr}" if getattr(e, "stderr", None) else ""
         return die(f"ffmpeg failed (exit {e.returncode}). Is the input a valid audio/video file?{detail}", code=2)
 
-
     except KeyboardInterrupt:
         return die("Interrupted by user.", code=130)
 
     except Exception as e:
-        # Unexpected failure
         if args.debug:
             traceback.print_exc()
         return die(f"Unhandled error: {e}", code=1)
