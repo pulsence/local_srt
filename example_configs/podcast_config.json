@@ -1,0 +1,18 @@
+{
+  "max_chars": 40,
+  "max_lines": 2,
+
+  "target_cps": 16.0,
+  "min_dur": 0.9,
+  "max_dur": 5.0,
+
+  "allow_commas": true,
+  "allow_medium": true,
+  "prefer_punct_splits": true,
+
+  "min_gap": 0.08,
+  "pad": 0.05,
+
+  "vad_filter": true,
+  "word_timestamps": false
+}
