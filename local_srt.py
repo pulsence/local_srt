@@ -2,6 +2,8 @@ import argparse
 import os
 import re
 import subprocess
+import sys
+import time
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -44,6 +46,10 @@ class SubtitleBlock:
     start: float
     end: float
     lines: List[str]  # 1–2 lines
+
+# -----------------------------
+# Loging helpers
+# -----------------------------
 
 # -----------------------------
 # Chunking rules
@@ -348,6 +354,8 @@ def write_srt(subs: List[SubtitleBlock], out_path: str):
 # -----------------------------
 # Main CLI
 # -----------------------------
+
+
 def main():
     ap = argparse.ArgumentParser(description="Local SRT generator (faster-whisper + ffmpeg)")
     ap.add_argument("input", help="Path to audio/video file")
@@ -355,17 +363,105 @@ def main():
     ap.add_argument("--model", default="small", help="tiny/base/small/medium/large-v3")
     ap.add_argument("--device", default="cpu", help="cpu or cuda")
     ap.add_argument("--language", default=None, help="Optional language code (e.g., en). If omitted, auto-detect.")
-    ap.add_argument("--max_chars", type=int, default=42, help="Max characters per subtitle line")
-    ap.add_argument("--max_lines", type=int, default=2, help="Max lines per subtitle block")
-    ap.add_argument("--target_cps", type=float, default=17.0, help="Target characters-per-second for readability")
-    ap.add_argument("--min_dur", type=float, default=1.0, help="Minimum subtitle duration in seconds")
-    ap.add_argument("--max_dur", type=float, default=6.0, help="Maximum subtitle duration in seconds")
+    ap.add_argument("--max_chars", type=int, default=None, help="Max characters per subtitle line")
+    ap.add_argument("--max_lines", type=int, default=None, help="Max lines per subtitle block")
+    ap.add_argument("--target_cps", type=float, default=None, help="Target characters-per-second for readability")
+    ap.add_argument("--min_dur", type=float, default=None, help="Minimum subtitle duration in seconds")
+    ap.add_argument("--max_dur", type=float, default=None, help="Maximum subtitle duration in seconds")
     ap.add_argument("--keep_wav", action="store_true", help="Do not delete temporary WAV file")
     ap.add_argument("--no-comma-split", action="store_true", help="Do not split on commas")
     ap.add_argument("--no-medium-split", action="store_true", help="Do not split on ';' or ':'")
     ap.add_argument("--prefer-punct-splits", action="store_true",
                     help="Prefer punctuation-based splits even if text already fits")
+    ap.add_argument(
+        "--mode",
+        choices=["shorts", "yt", "podcast"],
+        default=None,
+        help="Preset configuration: 'shorts' (short captions, faster pacing), 'yt' (standard video captions), or 'podcast' (longer captions, slower pacing)",
+    )
+    ap.add_argument("--quiet", action="store_true", help="Suppress non-error output")
+    ap.add_argument("--no-progress", action="store_true", help="Disable progress output")
     args = ap.parse_args()
+
+    PRESETS = {
+        # Designed for vertical shorts: shorter lines, slightly faster pacing, and
+        # more aggressive punctuation splitting so captions feel "snappier".
+        "shorts": {
+            "max_chars": 28,
+            "max_lines": 2,
+            "target_cps": 15.0,
+            "min_dur": 0.7,
+            "max_dur": 3.0,
+            "prefer_punct_splits": True,
+            # In shorts, commas tend to over-fragment; default to off.
+            "allow_commas": False,
+            "allow_medium": True,
+        },
+        # Standard YouTube video captions: comfortable line length, stable pacing.
+        "yt": {
+            "max_chars": 42,
+            "max_lines": 2,
+            "target_cps": 17.0,
+            "min_dur": 1.0,
+            "max_dur": 6.0,
+            "prefer_punct_splits": False,
+            "allow_commas": True,
+            "allow_medium": True,
+        },
+        "podcast": {
+            "max_chars": 40,
+            "max_lines": 2,
+            "target_cps": 16.0,
+            "min_dur": 0.9,
+            "max_dur": 5.0,
+            "prefer_punct_splits": True,
+            "allow_commas": True,
+            "allow_medium": True,
+        },
+    }
+
+    # Start with baseline defaults (equivalent to your previous defaults)
+    resolved = {
+        "max_chars": 42,
+        "max_lines": 2,
+        "target_cps": 17.0,
+        "min_dur": 1.0,
+        "max_dur": 6.0,
+        "prefer_punct_splits": args.prefer_punct_splits,
+        "allow_commas": not args.no_comma_split,
+        "allow_medium": not args.no_medium_split,
+    }
+
+    # If a mode is selected, apply its preset as the new baseline
+    if args.mode:
+        preset = PRESETS[args.mode]
+        # apply preset to resolved
+        for k, v in preset.items():
+            resolved[k] = v
+
+    # Now, apply user overrides (only for parameters that were passed explicitly)
+    # For numeric args, explicit means args.<name> is not None.
+    if args.max_chars is not None:
+        resolved["max_chars"] = args.max_chars
+    if args.max_lines is not None:
+        resolved["max_lines"] = args.max_lines
+    if args.target_cps is not None:
+        resolved["target_cps"] = args.target_cps
+    if args.min_dur is not None:
+        resolved["min_dur"] = args.min_dur
+    if args.max_dur is not None:
+        resolved["max_dur"] = args.max_dur
+
+    # For boolean-ish punctuation flags:
+    # These are explicit by presence; your current flags already reflect explicit choices.
+    # However, when mode is set, we want the mode to control defaults unless user explicitly asked otherwise.
+    # We treat the presence of the --no-* flags as explicit overrides.
+    if args.no_comma_split:
+        resolved["allow_commas"] = False
+    if args.no_medium_split:
+        resolved["allow_medium"] = False
+    if args.prefer_punct_splits:
+        resolved["prefer_punct_splits"] = True
 
     tmp_wav = "tmp_16k_mono.wav"
     try:
@@ -383,14 +479,14 @@ def main():
         seg_list = list(segments)
         subs = chunk_segments_to_subtitles(
             seg_list,
-            max_chars_per_line=args.max_chars,
-            max_lines=args.max_lines,
-            target_cps=args.target_cps,
-            min_duration=args.min_dur,
-            max_duration=args.max_dur,
-            allow_commas=not args.no_comma_split,
-            allow_medium=not args.no_medium_split,
-            prefer_punct_splits=args.prefer_punct_splits,
+            max_chars_per_line=resolved["max_chars"],
+            max_lines=resolved["max_lines"],
+            target_cps=resolved["target_cps"],
+            min_duration=resolved["min_dur"],
+            max_duration=resolved["max_dur"],
+            allow_commas=resolved["allow_commas"],
+            allow_medium=resolved["allow_medium"],
+            prefer_punct_splits=resolved["prefer_punct_splits"],
         )
 
         write_srt(subs, args.output)
@@ -406,3 +502,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+#END FILE
