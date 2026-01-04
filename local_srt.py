@@ -4,6 +4,10 @@ import re
 import subprocess
 import sys
 import time
+from pathlib import Path
+import shutil
+import traceback
+import tempfile
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -75,6 +79,56 @@ def format_duration(seconds: float) -> str:
     if h > 0:
         return f"{h:d}:{m:02d}:{s:02d}"
     return f"{m:d}:{s:02d}"
+
+# -----------------------------
+# Validation helpers
+# -----------------------------
+def die(msg: str, code: int = 1, *, quiet: bool = False) -> int:
+    # Always show errors, even in --quiet
+    print(f"ERROR: {msg}", file=sys.stderr, flush=True)
+    return code
+
+def ensure_parent_dir(path: Path) -> None:
+    parent = path.parent
+    if parent and not parent.exists():
+        parent.mkdir(parents=True, exist_ok=True)
+
+def preflight_checks(input_path: Path, output_path: Path) -> Tuple[bool, str]:
+    if not input_path.exists():
+        return False, f"Input file not found: {input_path}"
+    if input_path.is_dir():
+        return False, f"Input path is a directory, expected a media file: {input_path}"
+    if output_path.exists() and output_path.is_dir():
+        return False, f"Output path is a directory, expected a file: {output_path}"
+    return True, ""
+
+def init_whisper_model_with_fallback(
+    model_name: str,
+    device: str,
+    quiet: bool,
+):
+    """
+    If device == 'cuda', try CUDA first, fall back to CPU on failure.
+    Returns: (model, device_used, compute_type_used)
+    """
+    if device != "cuda":
+        compute_type = "int8" if device == "cpu" else "float16"
+        return WhisperModel(model_name, device=device, compute_type=compute_type), device, compute_type
+
+    # Try CUDA
+    try:
+        compute_type = "float16"
+        m = WhisperModel(model_name, device="cuda", compute_type=compute_type)
+        log("   CUDA available: using device=cuda compute_type=float16", quiet=quiet)
+        return m, "cuda", compute_type
+    except Exception as e:
+        # Fall back to CPU
+        log(f"   CUDA init failed; falling back to CPU. Reason: {e}", quiet=quiet)
+        compute_type = "int8"
+        m = WhisperModel(model_name, device="cpu", compute_type=compute_type)
+        log("   Using device=cpu compute_type=int8", quiet=quiet)
+        return m, "cpu", compute_type
+
 
 # -----------------------------
 # Chunking rules
@@ -488,18 +542,40 @@ def main():
     if args.prefer_punct_splits:
         resolved["prefer_punct_splits"] = True
 
-    tmp_wav = "tmp_16k_mono.wav"
     quiet = args.quiet
     show_progress = not args.no_progress
+
+    # Preflight checks
+    input_path = Path(args.input)
+    output_path = Path(args.output)
+
+    ok, reason = preflight_checks(input_path, output_path)
+    if not ok:
+        return die(reason, code=2)
+
+    # Ensure output directory exists
+    try:
+        ensure_parent_dir(output_path)
+    except Exception as e:
+        return die(f"Could not create output directory for: {output_path} ({e})", code=2)
+    
+    if shutil.which("ffmpeg") is None:
+        return die("ffmpeg not found on PATH. Install it or add it to PATH.", code=2)
+
+    fd, tmp_wav = tempfile.mkstemp(prefix="srtgen_", suffix=".wav")
+    os.close(fd)
 
     started = time.time()
     try:
         log("1/5 Converting audio with ffmpeg...", quiet=quiet)
-        to_wav_16k_mono(args.input, tmp_wav)
+        to_wav_16k_mono(str(input_path), tmp_wav)
 
         log("2/5 Loading model...", quiet=quiet)
-        compute_type = "int8" if args.device == "cpu" else "float16"
-        model = WhisperModel(args.model, device=args.device, compute_type=compute_type)
+        model, device_used, compute_type_used = init_whisper_model_with_fallback(
+            model_name=args.model,
+            device=args.device,
+            quiet=quiet,
+        )
 
         log("3/5 Transcribing...", quiet=quiet)
         t0 = time.time()
@@ -510,11 +586,9 @@ def main():
             language=args.language
         )
 
-        # Materialize generator so we can show progress and then reuse list
         seg_list = []
         for idx, seg in enumerate(segments_iter, start=1):
             seg_list.append(seg)
-            # We can show running count and latest timestamp
             progress_line(
                 f"   segments: {idx} | t={format_duration(seg.end)}",
                 enabled=show_progress,
@@ -526,6 +600,7 @@ def main():
 
         log("4/5 Chunking + formatting...", quiet=quiet)
         t1 = time.time()
+
         subs = chunk_segments_to_subtitles(
             seg_list,
             max_chars_per_line=resolved["max_chars"],
@@ -537,12 +612,30 @@ def main():
             allow_medium=resolved["allow_medium"],
             prefer_punct_splits=resolved["prefer_punct_splits"],
         )
+
         log(f"   Chunking complete: {len(subs)} subtitle blocks in {format_duration(time.time() - t1)}", quiet=quiet)
 
         log("5/5 Writing SRT...", quiet=quiet)
-        write_srt(subs, args.output)
+        write_srt(subs, str(output_path))
 
-        log(f"Done: {args.output}  (total {format_duration(time.time() - started)})", quiet=quiet)
+        log(f"Done: {output_path}  (total {format_duration(time.time() - started)})", quiet=quiet)
+        return 0
+
+    except FileNotFoundError as e:
+        # Common: ffmpeg not found, or input path typo (though we preflight input)
+        return die(str(e), code=2)
+
+    except subprocess.CalledProcessError as e:
+        # Common: ffmpeg failure on decoding file
+        return die(f"ffmpeg failed (exit {e.returncode}). Is the input a valid audio/video file?", code=2)
+
+    except KeyboardInterrupt:
+        return die("Interrupted by user.", code=130)
+
+    except Exception as e:
+        # Unexpected failure
+        # If you want full trace for debugging, you can add a --debug flag later
+        return die(f"Unhandled error: {e}", code=1)
 
     finally:
         if not args.keep_wav and os.path.exists(tmp_wav):
@@ -552,5 +645,5 @@ def main():
                 pass
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
 #END FILE
