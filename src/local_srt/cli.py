@@ -102,15 +102,15 @@ class ResolvedConfig:
 
 PRESETS: Dict[str, Dict[str, Any]] = {
     "shorts": {
-        "max_chars": 28,
-        "max_lines": 2,
-        "target_cps": 15.0,
+        "max_chars": 18,
+        "max_lines": 1,
+        "target_cps": 18.0,
         "min_dur": 0.7,
         "max_dur": 3.0,
-        "prefer_punct_splits": True,
-        "allow_commas": False,
+        "prefer_punct_splits": False,
+        "allow_commas": True,
         "allow_medium": True,
-        "min_gap": 0.05,
+        "min_gap": 0.08,
         "pad": 0.00,
     },
     "yt": {
@@ -139,6 +139,14 @@ PRESETS: Dict[str, Dict[str, Any]] = {
     },
 }
 
+MODE_ALIASES = {
+    "short": "shorts",
+    "shorts": "shorts",
+    "yt": "yt",
+    "youtube": "yt",
+    "pod": "podcast",
+    "podcast": "podcast",
+}
 
 def load_config_file(path: Optional[str]) -> Dict[str, Any]:
     if not path:
@@ -1028,7 +1036,7 @@ def main() -> int:
     ap.add_argument("--language", default=None, help="Optional language code (e.g., en). If omitted, auto-detect.")
     ap.add_argument("--word-timestamps", action="store_true", help="Request word timestamps (preserved in JSON outputs).")
 
-    ap.add_argument("--mode", choices=["shorts", "yt", "podcast"], default=None, help="Preset configuration mode.")
+    ap.add_argument("--mode", default=None, help="Preset modes: shorts | yt | podcast (aliases: short, youtube, pod).")
     ap.add_argument("--config", default=None, help="JSON config file. CLI args override config.")
     ap.add_argument("--dry-run", action="store_true", help="Validate inputs and show resolved settings, but do not transcribe.")
 
@@ -1068,6 +1076,16 @@ def main() -> int:
 
     quiet = args.quiet
     show_progress = not args.no_progress
+
+    if args.mode:
+        mode_key = args.mode.lower()
+        if mode_key not in MODE_ALIASES:
+            return die(
+                f"Invalid --mode '{args.mode}'. "
+                f"Valid modes: shorts, yt, podcast",
+                code=2,
+            )
+        args.mode = MODE_ALIASES[mode_key]
 
     # Expand inputs (files, dirs, globs)
     files = expand_inputs(args.inputs, args.glob)
