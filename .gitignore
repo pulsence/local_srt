@@ -5,3 +5,5 @@
 *.srt
 *.code-workspace
 
+build/
+*.egg-info/

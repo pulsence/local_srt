@@ -5,8 +5,17 @@ Local SRT generator using **faster-whisper** (offline transcription) and **ffmpe
 This tool converts audio or video files into readable `.srt` subtitle files with intelligent
 punctuation-aware chunking, pacing heuristics, and presets for YouTube, Shorts, and Podcasts.
 
+## Caveat Emptor
+This project was primarily created for my personal use. I will not be responding to pull requests
+or issues unless they directly impact my use cases. Feel free to fork and make whatever changes
+you would like. I was frustrated that a "turn key" local SRT generator was not easily 
+available, now there is.
+
+I generated this tool primarily using an AI code assistant and so all the code branches are not
+explored or tested, but they should be farely correct.
+
 ## Features
-- Fully local transcription (no API calls)
+- Fully local transcription (no remote API calls)
 - Uses `faster-whisper` for high-quality speech recognition
 - Intelligent subtitle chunking:
   - Punctuation-aware splitting (strong → medium → weak)
