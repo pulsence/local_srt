@@ -31,6 +31,13 @@ dependencies = [
   "faster-whisper>=1.0.0",
 ]
 
+[project.optional-dependencies]
+test = [
+  "pytest>=7.4.0",
+  "pytest-cov>=4.1.0",
+  "pytest-mock>=3.11.0",
+]
+
 [project.urls]
 Homepage = "https://github.com/pulsence/local_srt"
 Repository = "https://github.com/pulsence/local_srt"
@@ -60,3 +67,35 @@ python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false
+
+# -----------------------------
+# Pytest configuration
+# -----------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+  "-v",
+  "--cov=local_srt",
+  "--cov-report=term-missing",
+  "--cov-report=html",
+]
+
+# -----------------------------
+# Coverage configuration
+# -----------------------------
+[tool.coverage.run]
+source = ["src/local_srt"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+  "pragma: no cover",
+  "def __repr__",
+  "raise AssertionError",
+  "raise NotImplementedError",
+  "if __name__ == .__main__.:",
+  "if TYPE_CHECKING:",
+]
