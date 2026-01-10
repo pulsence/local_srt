@@ -35,13 +35,19 @@ This installs the package in editable mode along with test dependencies:
 pytest
 ```
 
-### Run with Coverage Report
+This automatically generates:
+- **Coverage report** in `htmlcov/index.html` - Shows which lines of code are covered by tests
+- **Test results report** in `report.html` - Shows pass/fail status of all tests
+
+### View Reports
 
 ```bash
-pytest --cov=local_srt --cov-report=html
-```
+# Open coverage report
+start htmlcov/index.html
 
-This generates an HTML coverage report in the `htmlcov/` directory.
+# Open test results report
+start report.html
+```
 
 ### Run Specific Test File
 

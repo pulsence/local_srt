@@ -8,6 +8,9 @@ build/
 *.egg-info/
 __pycache__/
 .coverage
+.pytest_cache/
+htmlcov/
+report.html
 
 TODO
 .claude/
