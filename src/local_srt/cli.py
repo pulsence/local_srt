@@ -1,1098 +1,55 @@
 #!/usr/bin/env python3
+"""Command-line interface for Local SRT.
+
+This is the main entry point for the srtgen command-line tool.
+"""
 from __future__ import annotations
 
 import argparse
 import dataclasses
-import glob
-import json
 import os
-import platform
-import re
-import shutil
-import subprocess
-import sys
 import tempfile
 import time
 import traceback
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
-
-from faster_whisper import WhisperModel
-from faster_whisper import utils as fw_utils
-
-
-# ============================================================
-# Versioning
-# ============================================================
-
-TOOL_VERSION = "0.1.0"
-
-
-# ============================================================
-# Logging / Progress
-# ============================================================
-
-def log(msg: str, *, quiet: bool = False) -> None:
-    if not quiet:
-        print(msg, flush=True)
-
-
-def warn(msg: str, *, quiet: bool = False) -> None:
-    if not quiet:
-        print(f"WARNING: {msg}", file=sys.stderr, flush=True)
-
-
-def die(msg: str, code: int = 1) -> int:
-    print(f"ERROR: {msg}", file=sys.stderr, flush=True)
-    return code
-
-
-def progress_line(msg: str, *, enabled: bool, quiet: bool) -> None:
-    if quiet or not enabled:
-        return
-    sys.stdout.write("\r" + msg[:160].ljust(160))
-    sys.stdout.flush()
-
-
-def progress_done(*, enabled: bool, quiet: bool) -> None:
-    if quiet or not enabled:
-        return
-    sys.stdout.write("\n")
-    sys.stdout.flush()
-
-
-def format_duration(seconds: float) -> str:
-    seconds = max(0, int(seconds))
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    if h > 0:
-        return f"{h:d}:{m:02d}:{s:02d}"
-    return f"{m:d}:{s:02d}"
-
-
-# ============================================================
-# Config / Presets
-# ============================================================
-
-@dataclass
-class ResolvedConfig:
-    # caption formatting
-    max_chars: int = 42
-    max_lines: int = 2
-
-    # readability / timing heuristics
-    target_cps: float = 17.0
-    min_dur: float = 1.0
-    max_dur: float = 6.0
-
-    # punctuation splitting
-    allow_commas: bool = True
-    allow_medium: bool = True
-    prefer_punct_splits: bool = False
-
-    # timing polish
-    min_gap: float = 0.08
-    pad: float = 0.00
-
-    # transcription options
-    vad_filter: bool = True
-    word_timestamps: bool = False
-
-    # silence-aware timing
-    use_silence_split: bool = True
-    silence_min_dur: float = 0.2
-    silence_threshold_db: float = -35.0
-
-
-PRESETS: Dict[str, Dict[str, Any]] = {
-    "shorts": {
-        "max_chars": 18,
-        "max_lines": 1,
-        "target_cps": 18.0,
-        "min_dur": 0.7,
-        "max_dur": 3.0,
-        "prefer_punct_splits": False,
-        "allow_commas": True,
-        "allow_medium": True,
-        "min_gap": 0.08,
-        "pad": 0.00,
-    },
-    "yt": {
-        "max_chars": 42,
-        "max_lines": 2,
-        "target_cps": 17.0,
-        "min_dur": 1.0,
-        "max_dur": 6.0,
-        "prefer_punct_splits": False,
-        "allow_commas": True,
-        "allow_medium": True,
-        "min_gap": 0.08,
-        "pad": 0.00,
-    },
-    "podcast": {
-        "max_chars": 40,
-        "max_lines": 2,
-        "target_cps": 16.0,
-        "min_dur": 0.9,
-        "max_dur": 5.0,
-        "prefer_punct_splits": True,
-        "allow_commas": True,
-        "allow_medium": True,
-        "min_gap": 0.08,
-        "pad": 0.05,
-    },
-}
-
-MODE_ALIASES = {
-    "short": "shorts",
-    "shorts": "shorts",
-    "yt": "yt",
-    "youtube": "yt",
-    "pod": "podcast",
-    "podcast": "podcast",
-}
-
-def load_config_file(path: Optional[str]) -> Dict[str, Any]:
-    if not path:
-        return {}
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"Config file not found: {p}")
-    data = json.loads(p.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError("Config must be a JSON object at top-level.")
-    return data
-
-
-def apply_overrides(base: ResolvedConfig, overrides: Dict[str, Any]) -> ResolvedConfig:
-    d = dataclasses.asdict(base)
-    for k, v in overrides.items():
-        if k in d:
-            d[k] = v
-    return ResolvedConfig(**d)
-
-
-# ============================================================
-# System / Dependency checks
-# ============================================================
-
-def ensure_parent_dir(path: Path) -> None:
-    parent = path.parent
-    if parent and not parent.exists():
-        parent.mkdir(parents=True, exist_ok=True)
-
-
-def which_or_none(name: str) -> Optional[str]:
-    return shutil.which(name)
-
-
-def ffmpeg_ok() -> bool:
-    return which_or_none("ffmpeg") is not None
-
-
-def ffprobe_ok() -> bool:
-    return which_or_none("ffprobe") is not None
-
-
-def run_cmd_text(cmd: List[str]) -> Tuple[int, str, str]:
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    return p.returncode, p.stdout, p.stderr
-
-
-def ffmpeg_version() -> Optional[str]:
-    if not ffmpeg_ok():
-        return None
-    code, out, _ = run_cmd_text(["ffmpeg", "-version"])
-    if code != 0:
-        return None
-    return out.splitlines()[0].strip() if out else None
-
-
-def ffprobe_version() -> Optional[str]:
-    if not ffprobe_ok():
-        return None
-    code, out, _ = run_cmd_text(["ffprobe", "-version"])
-    if code != 0:
-        return None
-    return out.splitlines()[0].strip() if out else None
-
-
-def probe_duration_seconds(path: str) -> Optional[float]:
-    if not ffprobe_ok():
-        return None
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        path
-    ]
-    code, out, _ = run_cmd_text(cmd)
-    if code != 0:
-        return None
-    try:
-        return float(out.strip())
-    except Exception:
-        return None
-
-
-_SILENCE_START_RE = re.compile(r"silence_start:\s*([0-9.]+)")
-_SILENCE_END_RE = re.compile(r"silence_end:\s*([0-9.]+)")
-
-
-def detect_silences(
-    wav_path: str,
-    *,
-    min_silence_dur: float,
-    silence_threshold_db: float,
-) -> List[Tuple[float, float]]:
-    if not ffmpeg_ok():
-        return []
-
-    filt = f"silencedetect=noise={silence_threshold_db}dB:d={min_silence_dur}"
-    cmd = ["ffmpeg", "-i", wav_path, "-af", filt, "-f", "null", "-"]
-    code, _, err = run_cmd_text(cmd)
-    if code != 0:
-        return []
-
-    silences: List[Tuple[float, float]] = []
-    pending_start: Optional[float] = None
-
-    for line in err.splitlines():
-        m = _SILENCE_START_RE.search(line)
-        if m:
-            pending_start = float(m.group(1))
-            continue
-        m = _SILENCE_END_RE.search(line)
-        if m and pending_start is not None:
-            end = float(m.group(1))
-            start = min(pending_start, end)
-            if end - start > 0:
-                silences.append((start, end))
-            pending_start = None
-
-    if pending_start is not None:
-        dur = probe_duration_seconds(wav_path)
-        if dur is not None and dur > pending_start:
-            silences.append((pending_start, dur))
-
-    if not silences:
-        return []
-
-    silences.sort(key=lambda x: x[0])
-    merged: List[Tuple[float, float]] = []
-    for s, e in silences:
-        if not merged or s > merged[-1][1]:
-            merged.append((s, e))
-        else:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-    return merged
-
-
-# ============================================================
-# Audio conversion
-# ============================================================
-
-def to_wav_16k_mono(input_path: str, wav_path: str) -> None:
-    cmd = [
-        "ffmpeg", "-y",
-        "-loglevel", "error",
-        "-i", input_path,
-        "-ac", "1",
-        "-ar", "16000",
-        "-vn",
-        wav_path,
-    ]
-    p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-    if p.returncode != 0:
-        tail = "\n".join((p.stderr or "").splitlines()[-20:])
-        raise subprocess.CalledProcessError(p.returncode, cmd, output=None, stderr=tail)
-
-
-# ============================================================
-# Device init
-# ============================================================
-
-def init_whisper_model(
-    model_name: str,
-    device: str,               # auto|cpu|cuda
-    quiet: bool,
-    strict_cuda: bool,
-) -> Tuple[WhisperModel, str, str]:
-    """
-    Returns: (model, device_used, compute_type_used)
-    """
-    if device == "cpu":
-        compute_type = "int8"
-        return WhisperModel(model_name, device="cpu", compute_type=compute_type), "cpu", compute_type
-
-    if device == "cuda":
-        try:
-            compute_type = "float16"
-            m = WhisperModel(model_name, device="cuda", compute_type=compute_type)
-            log("   Using device=cuda compute_type=float16", quiet=quiet)
-            return m, "cuda", compute_type
-        except Exception as e:
-            if strict_cuda:
-                raise RuntimeError(f"CUDA requested but init failed: {e}") from e
-            log(f"   CUDA init failed; falling back to CPU. Reason: {e}", quiet=quiet)
-            compute_type = "int8"
-            return WhisperModel(model_name, device="cpu", compute_type=compute_type), "cpu", compute_type
-
-    # auto
-    try:
-        compute_type = "float16"
-        m = WhisperModel(model_name, device="cuda", compute_type=compute_type)
-        log("   CUDA available: using device=cuda compute_type=float16", quiet=quiet)
-        return m, "cuda", compute_type
-    except Exception as e:
-        log(f"   CUDA not available; using CPU. Reason: {e}", quiet=quiet)
-        compute_type = "int8"
-        return WhisperModel(model_name, device="cpu", compute_type=compute_type), "cpu", compute_type
-
-
-# ============================================================
-# Text normalization / chunking
-# ============================================================
-
-def normalize_spaces(text: str) -> str:
-    text = text.replace("\u00a0", " ")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def wrap_text_lines(text: str, max_chars_per_line: int) -> List[str]:
-    text = normalize_spaces(text)
-    if not text:
-        return []
-    words = text.split(" ")
-    lines: List[str] = []
-    cur: List[str] = []
-
-    def cur_len() -> int:
-        return len(" ".join(cur)) if cur else 0
-
-    for w in words:
-        if not cur:
-            cur = [w]
-            continue
-        if cur_len() + 1 + len(w) <= max_chars_per_line:
-            cur.append(w)
-        else:
-            lines.append(" ".join(cur))
-            cur = [w]
-    if cur:
-        lines.append(" ".join(cur))
-    return lines
-
-
-def block_fits(text: str, max_chars_per_line: int, max_lines: int) -> bool:
-    return len(wrap_text_lines(text, max_chars_per_line)) <= max_lines
-
-
-def wrap_fallback_blocks(text: str, max_chars_per_line: int, max_lines: int) -> List[str]:
-    lines = wrap_text_lines(text, max_chars_per_line)
-    blocks: List[str] = []
-    for i in range(0, len(lines), max_lines):
-        blocks.append(" ".join(lines[i:i + max_lines]))
-    return blocks
-
-
-def split_on_delims(text: str, delims: str) -> List[str]:
-    text = normalize_spaces(text)
-    if not text:
-        return []
-    pattern = re.compile(rf".+?(?:[{re.escape(delims)}]+)(?=\s+)")
-    parts: List[str] = []
-    last_end = 0
-    for m in pattern.finditer(text):
-        end = m.end()
-        chunk = text[last_end:end].strip()
-        if chunk:
-            parts.append(chunk)
-        ws = re.match(r"\s+", text[end:])
-        last_end = end + (ws.end() if ws else 0)
-
-    rem = text[last_end:].strip()
-    if rem:
-        parts.append(rem)
-
-    parts = [p for p in parts if re.search(r"\w", p)]
-    return parts
-
-
-def split_text_into_blocks(
-    text: str,
-    max_chars_per_line: int,
-    max_lines: int,
-    allow_commas: bool = True,
-    allow_medium: bool = True,
-    prefer_punct_splits: bool = False,
-) -> List[str]:
-    text = normalize_spaces(text)
-    if not text:
-        return []
-
-    tiers: List[str] = [".?!"]
-    if allow_medium:
-        tiers.append(";:")
-    if allow_commas:
-        tiers.append(",")
-
-    def refine_chunk(chunk: str, tier_index: int) -> List[str]:
-        chunk = normalize_spaces(chunk)
-        if not chunk:
-            return []
-
-        fits = block_fits(chunk, max_chars_per_line, max_lines)
-        if fits and not (prefer_punct_splits and tier_index == 0):
-            return [chunk]
-
-        if tier_index >= len(tiers):
-            return wrap_fallback_blocks(chunk, max_chars_per_line, max_lines)
-
-        parts = split_on_delims(chunk, tiers[tier_index])
-        if len(parts) <= 1:
-            return refine_chunk(chunk, tier_index + 1)
-
-        out: List[str] = []
-        for p in parts:
-            out.extend(refine_chunk(p, tier_index + 1))
-        return out
-
-    blocks = refine_chunk(text, 0)
-
-    safe: List[str] = []
-    for b in blocks:
-        if block_fits(b, max_chars_per_line, max_lines):
-            safe.append(b)
-        else:
-            safe.extend(wrap_fallback_blocks(b, max_chars_per_line, max_lines))
-    return safe
-
-
-def preferred_split_index(text: str) -> int:
-    punct = [". ", "? ", "! ", "; ", ": ", ", "]
-    for p in punct:
-        idx = text.rfind(p)
-        if idx != -1 and idx > 20:
-            return idx + len(p)
-    sp = text.rfind(" ")
-    if sp > 20:
-        return sp + 1
-    return -1
-
-
-def distribute_time(start: float, end: float, parts: List[str]) -> List[Tuple[float, float, str]]:
-    total = max(1, sum(len(p) for p in parts))
-    dur = max(0.0, end - start)
-    out: List[Tuple[float, float, str]] = []
-    t = start
-    for i, p in enumerate(parts):
-        frac = len(p) / total
-        seg_dur = dur * frac if i < len(parts) - 1 else (end - t)
-        out.append((t, t + seg_dur, p))
-        t += seg_dur
-    return out
-
-
-def enforce_timing(
-    blocks: List[Tuple[float, float, str]],
-    min_dur: float,
-    max_dur: float,
-    *,
-    split_long: bool = True,
-) -> List[Tuple[float, float, str]]:
-    merged: List[Tuple[float, float, str]] = []
-    i = 0
-    while i < len(blocks):
-        s, e, txt = blocks[i]
-        dur = e - s
-        if dur < min_dur and i + 1 < len(blocks):
-            ns, ne, ntxt = blocks[i + 1]
-            merged.append((s, ne, normalize_spaces(txt + " " + ntxt)))
-            i += 2
-            continue
-        merged.append((s, e, txt))
-        i += 1
-
-    if not split_long:
-        return merged
-
-    final: List[Tuple[float, float, str]] = []
-    for s, e, txt in merged:
-        dur = e - s
-        if dur > max_dur and len(txt) > 120:
-            cut = preferred_split_index(txt)
-            if cut == -1:
-                cut = len(txt) // 2
-            p1 = normalize_spaces(txt[:cut])
-            p2 = normalize_spaces(txt[cut:])
-            parts = [p1, p2] if p2 else [p1]
-            final.extend(distribute_time(s, e, parts))
-        else:
-            final.append((s, e, txt))
-    return final
-
-
-@dataclass
-class SubtitleBlock:
-    start: float
-    end: float
-    lines: List[str]
-
-
-@dataclass
-class WordItem:
-    start: float
-    end: float
-    text: str
-
-
-def collect_words(segments: List[Any]) -> List[WordItem]:
-    words: List[WordItem] = []
-    for seg in segments:
-        for w in getattr(seg, "words", []) or []:
-            txt = normalize_spaces(getattr(w, "word", ""))
-            if not txt:
-                continue
-            words.append(WordItem(start=float(w.start), end=float(w.end), text=txt))
-    return words
-
-
-def words_to_text(words: List[WordItem]) -> str:
-    return normalize_spaces(" ".join(w.text for w in words))
-
-
-def silence_between(
-    start: float,
-    end: float,
-    silences: List[Tuple[float, float]],
-) -> Optional[Tuple[float, float]]:
-    for s, e in silences:
-        if s >= start and e <= end:
-            return (s, e)
-    return None
-
-
-def split_words_on_silence(
-    words: List[WordItem],
-    silences: List[Tuple[float, float]],
-) -> List[List[WordItem]]:
-    if not words:
-        return []
-    if not silences:
-        return [words]
-    runs: List[List[WordItem]] = []
-    cur: List[WordItem] = [words[0]]
-    for w in words[1:]:
-        gap = silence_between(cur[-1].end, w.start, silences)
-        if gap is not None:
-            runs.append(cur)
-            cur = [w]
-        else:
-            cur.append(w)
-    if cur:
-        runs.append(cur)
-    return runs
-
-
-def map_text_blocks_to_word_spans(
-    blocks: List[str],
-    words: List[WordItem],
-) -> List[Tuple[float, float, str]]:
-    out: List[Tuple[float, float, str]] = []
-    idx = 0
-    total = len(words)
-    for block in blocks:
-        count = len(normalize_spaces(block).split())
-        if count <= 0:
-            continue
-        if idx >= total:
-            break
-        take = min(count, total - idx)
-        chunk = words[idx:idx + take]
-        idx += take
-        if not chunk:
-            continue
-        out.append((chunk[0].start, chunk[-1].end, block))
-    return out
-
-
-def chunk_segments_to_subtitles(
-    segments: List[Any],
-    cfg: ResolvedConfig,
-) -> List[SubtitleBlock]:
-    raw: List[Tuple[float, float, str]] = []
-    for seg in segments:
-        txt = normalize_spaces(getattr(seg, "text", ""))
-        if not txt:
-            continue
-        raw.append((float(seg.start), float(seg.end), txt))
-
-    split_raw: List[Tuple[float, float, str]] = []
-    for s, e, txt in raw:
-        parts = split_text_into_blocks(
-            txt,
-            cfg.max_chars,
-            cfg.max_lines,
-            allow_commas=cfg.allow_commas,
-            allow_medium=cfg.allow_medium,
-            prefer_punct_splits=cfg.prefer_punct_splits,
-        )
-        if len(parts) == 1:
-            split_raw.append((s, e, txt))
-        else:
-            split_raw.extend(distribute_time(s, e, parts))
-
-    split_raw = enforce_timing(split_raw, cfg.min_dur, cfg.max_dur)
-
-    density_fixed: List[Tuple[float, float, str]] = []
-    for s, e, txt in split_raw:
-        dur = max(0.01, e - s)
-        cps = len(txt) / dur
-        if cps > cfg.target_cps and len(txt) > 80:
-            cut = preferred_split_index(txt)
-            if cut == -1:
-                cut = len(txt) // 2
-            p1 = normalize_spaces(txt[:cut])
-            p2 = normalize_spaces(txt[cut:])
-            parts = [p1, p2] if p2 else [p1]
-            density_fixed.extend(distribute_time(s, e, parts))
-        else:
-            density_fixed.append((s, e, txt))
-
-    subs: List[SubtitleBlock] = []
-    for s, e, txt in density_fixed:
-        txt = normalize_spaces(txt)
-        parts = split_text_into_blocks(
-            txt,
-            cfg.max_chars,
-            cfg.max_lines,
-            allow_commas=cfg.allow_commas,
-            allow_medium=cfg.allow_medium,
-            prefer_punct_splits=cfg.prefer_punct_splits,
-        )
-        timed_parts = distribute_time(s, e, parts) if len(parts) > 1 else [(s, e, txt)]
-        for ps, pe, ptxt in timed_parts:
-            lines = wrap_text_lines(ptxt, cfg.max_chars)
-            if len(lines) > cfg.max_lines:
-                lines = lines[:cfg.max_lines]
-            subs.append(SubtitleBlock(start=float(ps), end=float(pe), lines=lines))
-    return subs
-
-
-def chunk_words_to_subtitles(
-    words: List[WordItem],
-    cfg: ResolvedConfig,
-    silences: List[Tuple[float, float]],
-) -> List[SubtitleBlock]:
-    runs = split_words_on_silence(words, silences)
-    subs: List[SubtitleBlock] = []
-    for run in runs:
-        text = words_to_text(run)
-        parts = split_text_into_blocks(
-            text,
-            cfg.max_chars,
-            cfg.max_lines,
-            allow_commas=cfg.allow_commas,
-            allow_medium=cfg.allow_medium,
-            prefer_punct_splits=cfg.prefer_punct_splits,
-        )
-        timed_parts = map_text_blocks_to_word_spans(parts, run)
-        timed_parts = enforce_timing(
-            timed_parts,
-            cfg.min_dur,
-            cfg.max_dur,
-            split_long=False,
-        )
-        for s, e, ptxt in timed_parts:
-            lines = wrap_text_lines(ptxt, cfg.max_chars)
-            if len(lines) > cfg.max_lines:
-                lines = lines[:cfg.max_lines]
-            subs.append(SubtitleBlock(start=float(s), end=float(e), lines=lines))
-    return subs
-
-
-def words_to_subtitles(words: List[WordItem]) -> List[SubtitleBlock]:
-    subs: List[SubtitleBlock] = []
-    for w in words:
-        txt = normalize_spaces(w.text)
-        if not txt:
-            continue
-        subs.append(SubtitleBlock(start=float(w.start), end=float(w.end), lines=[txt]))
-    return subs
-
-
-def apply_silence_alignment(
-    subs: List[SubtitleBlock],
-    silences: List[Tuple[float, float]],
-) -> List[SubtitleBlock]:
-    if not subs or not silences:
-        return subs
-
-    aligned: List[SubtitleBlock] = []
-    for i, sb in enumerate(subs):
-        s = sb.start
-        e = sb.end
-
-        # Clamp if start/end sit inside detected silence.
-        for ss, ee in silences:
-            if s >= ss and s <= ee:
-                s = ee
-            if e >= ss and e <= ee:
-                e = ss
-
-        # If silence exists between this and next block, align to the gap.
-        if i + 1 < len(subs):
-            gap = silence_between(e, subs[i + 1].start, silences)
-            if gap is not None:
-                s_start, s_end = gap
-                e = min(e, s_start)
-                next_start = max(subs[i + 1].start, s_end)
-                subs[i + 1].start = next_start
-
-        if e < s + 0.001:
-            e = s + 0.001
-        aligned.append(SubtitleBlock(s, e, sb.lines))
-
-    return aligned
-
-# ============================================================
-# Timing polish + hygiene
-# ============================================================
-
-def subs_text(sb: SubtitleBlock) -> str:
-    return normalize_spaces(" ".join(sb.lines))
-
-
-def hygiene_and_polish(
-    subs: List[SubtitleBlock],
-    *,
-    min_gap: float,
-    pad: float,
-    silence_intervals: Optional[List[Tuple[float, float]]] = None,
-) -> List[SubtitleBlock]:
-    # Remove empties / normalize
-    cleaned: List[SubtitleBlock] = []
-    for sb in subs:
-        txt = subs_text(sb)
-        if not txt:
-            continue
-        s = max(0.0, float(sb.start))
-        e = max(s + 0.001, float(sb.end))
-        cleaned.append(SubtitleBlock(s, e, wrap_text_lines(txt, 10_000)))  # keep as single line temporarily
-
-    if not cleaned:
-        return []
-
-    # Sort by time
-    cleaned.sort(key=lambda x: (x.start, x.end))
-
-    # Merge identical consecutive blocks unless a silence gap is present
-    merged: List[SubtitleBlock] = []
-    for sb in cleaned:
-        if merged and subs_text(merged[-1]) == subs_text(sb):
-            if silence_intervals and silence_between(merged[-1].end, sb.start, silence_intervals):
-                merged.append(sb)
-            else:
-                merged[-1].end = max(merged[-1].end, sb.end)
-        else:
-            merged.append(sb)
-
-    # Apply padding and enforce gaps without overlap
-    out: List[SubtitleBlock] = []
-    for i, sb in enumerate(merged):
-        prev_end = out[-1].end if out else None
-        next_start = merged[i + 1].start if i + 1 < len(merged) else None
-
-        s = sb.start
-        e = sb.end
-
-        # Pad into silence where possible
-        if pad > 0:
-            if prev_end is not None:
-                s = max(prev_end + min_gap, s - pad)
-            else:
-                s = max(0.0, s - pad)
-
-            if next_start is not None:
-                e = min(next_start - min_gap, e + pad)
-            else:
-                e = e + pad
-
-        # Enforce min gap to previous unless silence gap already exists
-        if prev_end is not None:
-            if not silence_intervals or not silence_between(prev_end, s, silence_intervals):
-                if s < prev_end + min_gap:
-                    s = prev_end + min_gap
-                    if e < s + 0.001:
-                        e = s + 0.001
-
-        # Enforce min gap to next unless silence gap already exists
-        if next_start is not None:
-            if not silence_intervals or not silence_between(e, next_start, silence_intervals):
-                if e > next_start - min_gap:
-                    e = max(s + 0.001, next_start - min_gap)
-
-        out.append(SubtitleBlock(s, e, sb.lines))
-
-    # Final monotonic clamp
-    final: List[SubtitleBlock] = []
-    last_end = 0.0
-    for sb in out:
-        s = max(last_end, sb.start)
-        e = max(s + 0.001, sb.end)
-        final.append(SubtitleBlock(s, e, sb.lines))
-        last_end = e
-
-    return final
-
-
-# ============================================================
-# Writers (atomic)
-# ============================================================
-
-def format_srt_time(seconds: float) -> str:
-    ms = int(round(seconds * 1000))
-    h = ms // 3_600_000
-    ms %= 3_600_000
-    m = ms // 60_000
-    ms %= 60_000
-    s = ms // 1000
-    ms %= 1000
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-
-def format_vtt_time(seconds: float) -> str:
-    # WebVTT: HH:MM:SS.mmm
-    ms = int(round(seconds * 1000))
-    h = ms // 3_600_000
-    ms %= 3_600_000
-    m = ms // 60_000
-    ms %= 60_000
-    s = ms // 1000
-    ms %= 1000
-    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
-
-
-def format_ass_time(seconds: float) -> str:
-    cs = int(round(seconds * 100))
-    h = cs // 360_000
-    cs %= 360_000
-    m = cs // 6_000
-    cs %= 6_000
-    s = cs // 100
-    cs %= 100
-    return f"{h:d}:{m:02d}:{s:02d}.{cs:02d}"
-
-
-def atomic_write_text(path: Path, content: str) -> None:
-    ensure_parent_dir(path)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    os.replace(tmp, path)
-
-
-def write_srt(subs: List[SubtitleBlock], out_path: Path, *, max_chars: int, max_lines: int) -> None:
-    chunks: List[str] = []
-    for i, sb in enumerate(subs, start=1):
-        text = normalize_spaces(" ".join(sb.lines))
-        lines = wrap_text_lines(text, max_chars)
-        if len(lines) > max_lines:
-            lines = lines[:max_lines]
-        chunks.append(
-            f"{i}\n"
-            f"{format_srt_time(sb.start)} --> {format_srt_time(sb.end)}\n"
-            f"{'\n'.join(lines).strip()}\n"
-        )
-    atomic_write_text(out_path, "\n".join(chunks).strip() + "\n")
-
-
-def write_vtt(subs: List[SubtitleBlock], out_path: Path, *, max_chars: int, max_lines: int) -> None:
-    chunks: List[str] = ["WEBVTT\n"]
-    for sb in subs:
-        text = normalize_spaces(" ".join(sb.lines))
-        lines = wrap_text_lines(text, max_chars)
-        if len(lines) > max_lines:
-            lines = lines[:max_lines]
-        chunks.append(
-            f"{format_vtt_time(sb.start)} --> {format_vtt_time(sb.end)}\n"
-            f"{'\n'.join(lines).strip()}\n"
-        )
-    atomic_write_text(out_path, "\n".join(chunks).rstrip() + "\n")
-
-
-def write_ass(subs: List[SubtitleBlock], out_path: Path, *, max_chars: int, max_lines: int) -> None:
-    header = "\n".join(
-        [
-            "[Script Info]",
-            "ScriptType: v4.00+",
-            "PlayResX: 1920",
-            "PlayResY: 1080",
-            "WrapStyle: 0",
-            "ScaledBorderAndShadow: yes",
-            "",
-            "[V4+ Styles]",
-            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
-            "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
-            "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-            "Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,"
-            "1,2,0,2,80,80,60,1",
-            "",
-            "[Events]",
-            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
-        ]
-    )
-    events: List[str] = [header]
-    for sb in subs:
-        text = normalize_spaces(" ".join(sb.lines))
-        lines = wrap_text_lines(text, max_chars)
-        if len(lines) > max_lines:
-            lines = lines[:max_lines]
-        ass_text = "\\N".join(lines).strip()
-        events.append(
-            f"Dialogue: 0,{format_ass_time(sb.start)},{format_ass_time(sb.end)},Default,,0,0,0,,{ass_text}"
-        )
-    atomic_write_text(out_path, "\n".join(events).rstrip() + "\n")
-
-
-def write_txt(subs: List[SubtitleBlock], out_path: Path) -> None:
-    # Plain transcript derived from subtitle blocks (chronological)
-    lines: List[str] = []
-    for sb in subs:
-        lines.append(normalize_spaces(" ".join(sb.lines)))
-    atomic_write_text(out_path, "\n".join(lines).strip() + "\n")
-
-
-def segments_to_jsonable(segments: List[Any], *, include_words: bool) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for s in segments:
-        d: Dict[str, Any] = {
-            "start": float(s.start),
-            "end": float(s.end),
-            "text": getattr(s, "text", ""),
-        }
-        if include_words and getattr(s, "words", None):
-            d["words"] = [
-                {"start": float(w.start), "end": float(w.end), "word": w.word}
-                for w in s.words
-            ]
-        out.append(d)
-    return out
-
-
-def write_json_bundle(
-    out_path: Path,
-    *,
-    input_file: str,
-    device_used: str,
-    compute_type_used: str,
-    cfg: ResolvedConfig,
-    segments: List[Any],
-    subs: List[SubtitleBlock],
-) -> None:
-    payload = {
-        "tool_version": TOOL_VERSION,
-        "input_file": input_file,
-        "device_used": device_used,
-        "compute_type_used": compute_type_used,
-        "config": dataclasses.asdict(cfg),
-        "segments": segments_to_jsonable(segments, include_words=cfg.word_timestamps),
-        "subtitles": [
-            {"start": sb.start, "end": sb.end, "text": normalize_spaces(" ".join(sb.lines))}
-            for sb in subs
-        ],
-    }
-    ensure_parent_dir(out_path)
-    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, out_path)
-
-
-# ============================================================
-# Input expansion / batch planning
-# ============================================================
-
-MEDIA_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".mp4", ".mkv", ".mov", ".webm", ".m4v"}
-
-
-def iter_media_files_in_dir(d: Path) -> Iterable[Path]:
-    for p in d.rglob("*"):
-        if p.is_file() and p.suffix.lower() in MEDIA_EXTS:
-            yield p
-
-
-def expand_inputs(inputs: List[str], glob_pat: Optional[str]) -> List[Path]:
-    out: List[Path] = []
-    for s in inputs:
-        p = Path(s)
-        if p.exists() and p.is_dir():
-            out.extend(list(iter_media_files_in_dir(p)))
-        elif any(ch in s for ch in ["*", "?", "["]) and not p.exists():
-            out.extend([Path(x) for x in glob.glob(s)])
-        else:
-            out.append(p)
-
-    if glob_pat:
-        out.extend([Path(x) for x in glob.glob(glob_pat)])
-
-    # de-dupe, preserve order
-    seen = set()
-    uniq: List[Path] = []
-    for p in out:
-        rp = str(p.resolve()) if p.exists() else str(p)
-        if rp in seen:
-            continue
-        seen.add(rp)
-        uniq.append(p)
-    return uniq
-
-
-def default_output_for(input_file: Path, outdir: Optional[Path], fmt: str, keep_structure: bool, base_root: Optional[Path]) -> Path:
-    suffix = {
-        "srt": ".srt",
-        "vtt": ".vtt",
-        "txt": ".txt",
-        "ass": ".ass",
-        "json": ".json",
-    }[fmt]
-
-    if outdir is None:
-        return input_file.with_suffix(suffix)
-
-    if keep_structure and base_root and input_file.is_absolute():
-        try:
-            rel = input_file.relative_to(base_root)
-        except Exception:
-            rel = Path(input_file.name)
-    elif keep_structure and base_root:
-        try:
-            rel = input_file.resolve().relative_to(base_root.resolve())
-        except Exception:
-            rel = Path(input_file.name)
-    else:
-        rel = Path(input_file.name)
-
-    return (outdir / rel).with_suffix(suffix)
+from typing import Any, List, Optional, Tuple
+
+# Local imports from refactored modules
+from .audio import detect_silences, to_wav_16k_mono
+from .batch import default_output_for, expand_inputs, preflight_one
+from .config import MODE_ALIASES, PRESETS, apply_overrides, load_config_file
+from .logging_utils import die, format_duration, log, progress_done, progress_line, warn
+from .model_management import (
+    delete_model_cli,
+    diagnose,
+    download_model_cli,
+    list_available_models,
+    list_downloaded_models,
+)
+from .models import TOOL_VERSION, ResolvedConfig
+from .output_writers import (
+    segments_to_jsonable,
+    write_ass,
+    write_json_bundle,
+    write_srt,
+    write_txt,
+    write_vtt,
+)
+from .subtitle_generation import (
+    apply_silence_alignment,
+    chunk_segments_to_subtitles,
+    chunk_words_to_subtitles,
+    collect_words,
+    hygiene_and_polish,
+    words_to_subtitles,
+)
+from .system import ensure_parent_dir, ffmpeg_ok, probe_duration_seconds
+from .whisper_wrapper import init_whisper_model
 
 
 # ============================================================
 # Run one file
 # ============================================================
-
-def preflight_one(input_path: Path, output_path: Path, overwrite: bool) -> Tuple[bool, str]:
-    if not input_path.exists():
-        return False, f"Input file not found: {input_path}"
-    if input_path.is_dir():
-        return False, f"Input path is a directory (expected media file): {input_path}"
-    if output_path.exists() and output_path.is_dir():
-        return False, f"Output path is a directory (expected file): {output_path}"
-    if output_path.exists() and not overwrite:
-        return False, f"Output already exists: {output_path} (use --overwrite)"
-    return True, ""
-
 
 def run_one(
     *,
@@ -1107,6 +64,23 @@ def run_one(
     quiet: bool,
     show_progress: bool,
 ) -> int:
+    """Process a single media file and generate subtitles.
+
+    Args:
+        input_path: Path to input media file
+        output_path: Path for primary output file
+        fmt: Output format (srt/vtt/ass/txt/json)
+        transcript_path: Optional path for plain text transcript
+        segments_path: Optional path for segments JSON
+        json_bundle_path: Optional path for complete JSON bundle
+        args: Command-line arguments namespace
+        cfg: Resolved configuration
+        quiet: Suppress non-error output
+        show_progress: Show transcription progress
+
+    Returns:
+        Exit code (0 for success, non-zero for failure)
+    """
     if not ffmpeg_ok():
         return die("ffmpeg not found on PATH. Install it or add it to PATH.", 2)
 
@@ -1250,6 +224,7 @@ def run_one(
                 cfg=cfg,
                 segments=seg_list,
                 subs=subs,
+                tool_version=TOOL_VERSION,
             )
         else:
             return die(f"Unknown format: {fmt}", 2)
@@ -1260,6 +235,8 @@ def run_one(
             write_txt(subs, transcript_path)
 
         if segments_path:
+            import json
+
             ensure_parent_dir(segments_path)
             tmp = segments_path.with_suffix(segments_path.suffix + ".tmp")
             tmp.write_text(
@@ -1284,6 +261,7 @@ def run_one(
                 cfg=cfg,
                 segments=seg_list,
                 subs=subs,
+                tool_version=TOOL_VERSION,
             )
 
         log(f"Done: {output_path} (total {format_duration(time.time() - started)})", quiet=quiet)
@@ -1298,69 +276,15 @@ def run_one(
 
 
 # ============================================================
-# Diagnose / Version
-# ============================================================
-
-def diagnose() -> None:
-    print(f"tool_version: {TOOL_VERSION}")
-    print(f"python: {sys.version.split()[0]}")
-    print(f"platform: {platform.platform()}")
-    print(f"ffmpeg: {ffmpeg_version()}")
-    print(f"ffprobe: {ffprobe_version()}")
-    try:
-        import faster_whisper  # type: ignore
-        print(f"faster_whisper: {getattr(faster_whisper, '__version__', 'unknown')}")
-    except Exception:
-        print("faster_whisper: (unable to read version)")
-    print("PATH ffmpeg:", which_or_none("ffmpeg"))
-    print("PATH ffprobe:", which_or_none("ffprobe"))
-
-
-def list_downloaded_models() -> List[Tuple[str, str]]:
-    downloaded: List[Tuple[str, str]] = []
-    for name in fw_utils.available_models():
-        try:
-            path = fw_utils.download_model(name, local_files_only=True)
-        except Exception:
-            continue
-        if path and os.path.exists(path):
-            downloaded.append((name, path))
-    return downloaded
-
-
-def list_available_models() -> List[str]:
-    return list(fw_utils.available_models())
-
-
-def download_model_cli(model_name: str) -> int:
-    try:
-        path = fw_utils.download_model(model_name, local_files_only=False)
-    except Exception as e:
-        return die(f"Failed to download model '{model_name}': {e}", 2)
-    print(f"Downloaded {model_name} to {path}")
-    return 0
-
-
-def delete_model_cli(model_name: str) -> int:
-    try:
-        path = fw_utils.download_model(model_name, local_files_only=True)
-    except Exception:
-        return die(f"Model '{model_name}' is not downloaded.", 2)
-    if not path or not os.path.exists(path):
-        return die(f"Model '{model_name}' is not downloaded.", 2)
-    try:
-        shutil.rmtree(path)
-    except Exception as e:
-        return die(f"Failed to delete model '{model_name}': {e}", 2)
-    print(f"Deleted cached model: {model_name}")
-    return 0
-
-
-# ============================================================
 # CLI
 # ============================================================
 
 def main() -> int:
+    """Main entry point for the srtgen command-line tool.
+
+    Returns:
+        Exit code (0 for success, non-zero for failure)
+    """
     ap = argparse.ArgumentParser(description="Local SRT/VTT generator (faster-whisper + ffmpeg)")
     ap.add_argument("inputs", nargs="*", help="Media file(s), directory, or glob pattern(s)")
     ap.add_argument("--glob", default=None, help="Additional glob pattern to include (optional)")
@@ -1558,6 +482,7 @@ def main() -> int:
 
     # Show resolved config for transparency
     if args.dry_run and not quiet:
+        import json
         log("Resolved config:", quiet=quiet)
         log(json.dumps(dataclasses.asdict(cfg), indent=2), quiet=quiet)
 
@@ -1636,4 +561,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-#END OF FILE

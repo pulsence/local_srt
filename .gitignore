@@ -1,12 +1,14 @@
-# Ignore all mp3 files
 *.mp3
 *.mp4
 *.wav
 *.srt
 *.ass
-*.code-workspace
 
 build/
 *.egg-info/
+__pycache__/
 
 TODO
+.claude/
+.vscode/
+*.code-workspace

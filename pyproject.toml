@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "local-srt"
-version = "0.1.0"
+version = "0.1.1"
 description = "Local SRT generator using faster-whisper + ffmpeg"
 readme = "README.md"
 requires-python = ">=3.10"
