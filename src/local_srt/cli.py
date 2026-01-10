@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from faster_whisper import WhisperModel
+from faster_whisper import utils as fw_utils
 
 
 # ============================================================
@@ -98,6 +99,11 @@ class ResolvedConfig:
     # transcription options
     vad_filter: bool = True
     word_timestamps: bool = False
+
+    # silence-aware timing
+    use_silence_split: bool = True
+    silence_min_dur: float = 0.2
+    silence_threshold_db: float = -35.0
 
 
 PRESETS: Dict[str, Dict[str, Any]] = {
@@ -229,6 +235,59 @@ def probe_duration_seconds(path: str) -> Optional[float]:
         return float(out.strip())
     except Exception:
         return None
+
+
+_SILENCE_START_RE = re.compile(r"silence_start:\s*([0-9.]+)")
+_SILENCE_END_RE = re.compile(r"silence_end:\s*([0-9.]+)")
+
+
+def detect_silences(
+    wav_path: str,
+    *,
+    min_silence_dur: float,
+    silence_threshold_db: float,
+) -> List[Tuple[float, float]]:
+    if not ffmpeg_ok():
+        return []
+
+    filt = f"silencedetect=noise={silence_threshold_db}dB:d={min_silence_dur}"
+    cmd = ["ffmpeg", "-i", wav_path, "-af", filt, "-f", "null", "-"]
+    code, _, err = run_cmd_text(cmd)
+    if code != 0:
+        return []
+
+    silences: List[Tuple[float, float]] = []
+    pending_start: Optional[float] = None
+
+    for line in err.splitlines():
+        m = _SILENCE_START_RE.search(line)
+        if m:
+            pending_start = float(m.group(1))
+            continue
+        m = _SILENCE_END_RE.search(line)
+        if m and pending_start is not None:
+            end = float(m.group(1))
+            start = min(pending_start, end)
+            if end - start > 0:
+                silences.append((start, end))
+            pending_start = None
+
+    if pending_start is not None:
+        dur = probe_duration_seconds(wav_path)
+        if dur is not None and dur > pending_start:
+            silences.append((pending_start, dur))
+
+    if not silences:
+        return []
+
+    silences.sort(key=lambda x: x[0])
+    merged: List[Tuple[float, float]] = []
+    for s, e in silences:
+        if not merged or s > merged[-1][1]:
+            merged.append((s, e))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+    return merged
 
 
 # ============================================================
@@ -441,7 +500,9 @@ def distribute_time(start: float, end: float, parts: List[str]) -> List[Tuple[fl
 def enforce_timing(
     blocks: List[Tuple[float, float, str]],
     min_dur: float,
-    max_dur: float
+    max_dur: float,
+    *,
+    split_long: bool = True,
 ) -> List[Tuple[float, float, str]]:
     merged: List[Tuple[float, float, str]] = []
     i = 0
@@ -455,6 +516,9 @@ def enforce_timing(
             continue
         merged.append((s, e, txt))
         i += 1
+
+    if not split_long:
+        return merged
 
     final: List[Tuple[float, float, str]] = []
     for s, e, txt in merged:
@@ -477,6 +541,83 @@ class SubtitleBlock:
     start: float
     end: float
     lines: List[str]
+
+
+@dataclass
+class WordItem:
+    start: float
+    end: float
+    text: str
+
+
+def collect_words(segments: List[Any]) -> List[WordItem]:
+    words: List[WordItem] = []
+    for seg in segments:
+        for w in getattr(seg, "words", []) or []:
+            txt = normalize_spaces(getattr(w, "word", ""))
+            if not txt:
+                continue
+            words.append(WordItem(start=float(w.start), end=float(w.end), text=txt))
+    return words
+
+
+def words_to_text(words: List[WordItem]) -> str:
+    return normalize_spaces(" ".join(w.text for w in words))
+
+
+def silence_between(
+    start: float,
+    end: float,
+    silences: List[Tuple[float, float]],
+) -> Optional[Tuple[float, float]]:
+    for s, e in silences:
+        if s >= start and e <= end:
+            return (s, e)
+    return None
+
+
+def split_words_on_silence(
+    words: List[WordItem],
+    silences: List[Tuple[float, float]],
+) -> List[List[WordItem]]:
+    if not words:
+        return []
+    if not silences:
+        return [words]
+    runs: List[List[WordItem]] = []
+    cur: List[WordItem] = [words[0]]
+    for w in words[1:]:
+        gap = silence_between(cur[-1].end, w.start, silences)
+        if gap is not None:
+            runs.append(cur)
+            cur = [w]
+        else:
+            cur.append(w)
+    if cur:
+        runs.append(cur)
+    return runs
+
+
+def map_text_blocks_to_word_spans(
+    blocks: List[str],
+    words: List[WordItem],
+) -> List[Tuple[float, float, str]]:
+    out: List[Tuple[float, float, str]] = []
+    idx = 0
+    total = len(words)
+    for block in blocks:
+        count = len(normalize_spaces(block).split())
+        if count <= 0:
+            continue
+        if idx >= total:
+            break
+        take = min(count, total - idx)
+        chunk = words[idx:idx + take]
+        idx += take
+        if not chunk:
+            continue
+        out.append((chunk[0].start, chunk[-1].end, block))
+    return out
 
 
 def chunk_segments_to_subtitles(
@@ -542,6 +683,82 @@ def chunk_segments_to_subtitles(
     return subs
 
 
+def chunk_words_to_subtitles(
+    words: List[WordItem],
+    cfg: ResolvedConfig,
+    silences: List[Tuple[float, float]],
+) -> List[SubtitleBlock]:
+    runs = split_words_on_silence(words, silences)
+    subs: List[SubtitleBlock] = []
+    for run in runs:
+        text = words_to_text(run)
+        parts = split_text_into_blocks(
+            text,
+            cfg.max_chars,
+            cfg.max_lines,
+            allow_commas=cfg.allow_commas,
+            allow_medium=cfg.allow_medium,
+            prefer_punct_splits=cfg.prefer_punct_splits,
+        )
+        timed_parts = map_text_blocks_to_word_spans(parts, run)
+        timed_parts = enforce_timing(
+            timed_parts,
+            cfg.min_dur,
+            cfg.max_dur,
+            split_long=False,
+        )
+        for s, e, ptxt in timed_parts:
+            lines = wrap_text_lines(ptxt, cfg.max_chars)
+            if len(lines) > cfg.max_lines:
+                lines = lines[:cfg.max_lines]
+            subs.append(SubtitleBlock(start=float(s), end=float(e), lines=lines))
+    return subs
+
+
+def words_to_subtitles(words: List[WordItem]) -> List[SubtitleBlock]:
+    subs: List[SubtitleBlock] = []
+    for w in words:
+        txt = normalize_spaces(w.text)
+        if not txt:
+            continue
+        subs.append(SubtitleBlock(start=float(w.start), end=float(w.end), lines=[txt]))
+    return subs
+
+
+def apply_silence_alignment(
+    subs: List[SubtitleBlock],
+    silences: List[Tuple[float, float]],
+) -> List[SubtitleBlock]:
+    if not subs or not silences:
+        return subs
+
+    aligned: List[SubtitleBlock] = []
+    for i, sb in enumerate(subs):
+        s = sb.start
+        e = sb.end
+
+        # Clamp if start/end sit inside detected silence.
+        for ss, ee in silences:
+            if s >= ss and s <= ee:
+                s = ee
+            if e >= ss and e <= ee:
+                e = ss
+
+        # If silence exists between this and next block, align to the gap.
+        if i + 1 < len(subs):
+            gap = silence_between(e, subs[i + 1].start, silences)
+            if gap is not None:
+                s_start, s_end = gap
+                e = min(e, s_start)
+                next_start = max(subs[i + 1].start, s_end)
+                subs[i + 1].start = next_start
+
+        if e < s + 0.001:
+            e = s + 0.001
+        aligned.append(SubtitleBlock(s, e, sb.lines))
+
+    return aligned
+
 # ============================================================
 # Timing polish + hygiene
 # ============================================================
@@ -550,7 +767,13 @@ def subs_text(sb: SubtitleBlock) -> str:
     return normalize_spaces(" ".join(sb.lines))
 
 
-def hygiene_and_polish(subs: List[SubtitleBlock], *, min_gap: float, pad: float) -> List[SubtitleBlock]:
+def hygiene_and_polish(
+    subs: List[SubtitleBlock],
+    *,
+    min_gap: float,
+    pad: float,
+    silence_intervals: Optional[List[Tuple[float, float]]] = None,
+) -> List[SubtitleBlock]:
     # Remove empties / normalize
     cleaned: List[SubtitleBlock] = []
     for sb in subs:
@@ -567,11 +790,14 @@ def hygiene_and_polish(subs: List[SubtitleBlock], *, min_gap: float, pad: float)
     # Sort by time
     cleaned.sort(key=lambda x: (x.start, x.end))
 
-    # Merge identical consecutive blocks
+    # Merge identical consecutive blocks unless a silence gap is present
     merged: List[SubtitleBlock] = []
     for sb in cleaned:
         if merged and subs_text(merged[-1]) == subs_text(sb):
-            merged[-1].end = max(merged[-1].end, sb.end)
+            if silence_intervals and silence_between(merged[-1].end, sb.start, silence_intervals):
+                merged.append(sb)
+            else:
+                merged[-1].end = max(merged[-1].end, sb.end)
         else:
             merged.append(sb)
 
@@ -596,15 +822,19 @@ def hygiene_and_polish(subs: List[SubtitleBlock], *, min_gap: float, pad: float)
             else:
                 e = e + pad
 
-        # Enforce min gap to previous
-        if prev_end is not None and s < prev_end + min_gap:
-            s = prev_end + min_gap
-            if e < s + 0.001:
-                e = s + 0.001
+        # Enforce min gap to previous unless silence gap already exists
+        if prev_end is not None:
+            if not silence_intervals or not silence_between(prev_end, s, silence_intervals):
+                if s < prev_end + min_gap:
+                    s = prev_end + min_gap
+                    if e < s + 0.001:
+                        e = s + 0.001
 
-        # Enforce min gap to next
-        if next_start is not None and e > next_start - min_gap:
-            e = max(s + 0.001, next_start - min_gap)
+        # Enforce min gap to next unless silence gap already exists
+        if next_start is not None:
+            if not silence_intervals or not silence_between(e, next_start, silence_intervals):
+                if e > next_start - min_gap:
+                    e = max(s + 0.001, next_start - min_gap)
 
         out.append(SubtitleBlock(s, e, sb.lines))
 
@@ -647,6 +877,17 @@ def format_vtt_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
 
+def format_ass_time(seconds: float) -> str:
+    cs = int(round(seconds * 100))
+    h = cs // 360_000
+    cs %= 360_000
+    m = cs // 6_000
+    cs %= 6_000
+    s = cs // 100
+    cs %= 100
+    return f"{h:d}:{m:02d}:{s:02d}.{cs:02d}"
+
+
 def atomic_write_text(path: Path, content: str) -> None:
     ensure_parent_dir(path)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -681,6 +922,40 @@ def write_vtt(subs: List[SubtitleBlock], out_path: Path, *, max_chars: int, max_
             f"{'\n'.join(lines).strip()}\n"
         )
     atomic_write_text(out_path, "\n".join(chunks).rstrip() + "\n")
+
+
+def write_ass(subs: List[SubtitleBlock], out_path: Path, *, max_chars: int, max_lines: int) -> None:
+    header = "\n".join(
+        [
+            "[Script Info]",
+            "ScriptType: v4.00+",
+            "PlayResX: 1920",
+            "PlayResY: 1080",
+            "WrapStyle: 0",
+            "ScaledBorderAndShadow: yes",
+            "",
+            "[V4+ Styles]",
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+            "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
+            "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+            "Style: Default,Arial,48,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,"
+            "1,2,0,2,80,80,60,1",
+            "",
+            "[Events]",
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+        ]
+    )
+    events: List[str] = [header]
+    for sb in subs:
+        text = normalize_spaces(" ".join(sb.lines))
+        lines = wrap_text_lines(text, max_chars)
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+        ass_text = "\\N".join(lines).strip()
+        events.append(
+            f"Dialogue: 0,{format_ass_time(sb.start)},{format_ass_time(sb.end)},Default,,0,0,0,,{ass_text}"
+        )
+    atomic_write_text(out_path, "\n".join(events).rstrip() + "\n")
 
 
 def write_txt(subs: List[SubtitleBlock], out_path: Path) -> None:
@@ -780,6 +1055,7 @@ def default_output_for(input_file: Path, outdir: Optional[Path], fmt: str, keep_
         "srt": ".srt",
         "vtt": ".vtt",
         "txt": ".txt",
+        "ass": ".ass",
         "json": ".json",
     }[fmt]
 
@@ -924,8 +1200,35 @@ def run_one(
 
         log("4/5 Chunking + formatting...", quiet=quiet)
         t1 = time.time()
-        subs = chunk_segments_to_subtitles(seg_list, cfg)
-        subs = hygiene_and_polish(subs, min_gap=cfg.min_gap, pad=cfg.pad)
+        silences: List[Tuple[float, float]] = []
+        if cfg.use_silence_split:
+            silences = detect_silences(
+                tmp_wav,
+                min_silence_dur=cfg.silence_min_dur,
+                silence_threshold_db=cfg.silence_threshold_db,
+            )
+
+        words = collect_words(seg_list) if cfg.word_timestamps else []
+        if args.word_level:
+            if not words:
+                return die("Word-level output requested but no word timestamps are available.", 2)
+            subs = words_to_subtitles(words)
+        else:
+            if cfg.use_silence_split and words:
+                subs = chunk_words_to_subtitles(words, cfg, silences)
+            else:
+                if cfg.use_silence_split and not words:
+                    warn("Silence splitting requested but no word timestamps returned; falling back.", quiet=quiet)
+                subs = chunk_segments_to_subtitles(seg_list, cfg)
+
+        if cfg.use_silence_split and silences:
+            subs = apply_silence_alignment(subs, silences)
+        subs = hygiene_and_polish(
+            subs,
+            min_gap=cfg.min_gap,
+            pad=cfg.pad,
+            silence_intervals=silences if cfg.use_silence_split else None,
+        )
         log(f"   Chunking complete: {len(subs)} subtitle blocks in {format_duration(time.time() - t1)}", quiet=quiet)
 
         log("5/5 Writing outputs...", quiet=quiet)
@@ -934,6 +1237,8 @@ def run_one(
             write_srt(subs, output_path, max_chars=cfg.max_chars, max_lines=cfg.max_lines)
         elif fmt == "vtt":
             write_vtt(subs, output_path, max_chars=cfg.max_chars, max_lines=cfg.max_lines)
+        elif fmt == "ass":
+            write_ass(subs, output_path, max_chars=cfg.max_chars, max_lines=cfg.max_lines)
         elif fmt == "txt":
             write_txt(subs, output_path)
         elif fmt == "json":
@@ -1011,13 +1316,49 @@ def diagnose() -> None:
     print("PATH ffprobe:", which_or_none("ffprobe"))
 
 
+def list_downloaded_models() -> List[Tuple[str, str]]:
+    downloaded: List[Tuple[str, str]] = []
+    for name in fw_utils.available_models():
+        try:
+            path = fw_utils.download_model(name, local_files_only=True)
+        except Exception:
+            continue
+        if path and os.path.exists(path):
+            downloaded.append((name, path))
+    return downloaded
+
+
+def download_model_cli(model_name: str) -> int:
+    try:
+        path = fw_utils.download_model(model_name, local_files_only=False)
+    except Exception as e:
+        return die(f"Failed to download model '{model_name}': {e}", 2)
+    print(f"Downloaded {model_name} to {path}")
+    return 0
+
+
+def delete_model_cli(model_name: str) -> int:
+    try:
+        path = fw_utils.download_model(model_name, local_files_only=True)
+    except Exception:
+        return die(f"Model '{model_name}' is not downloaded.", 2)
+    if not path or not os.path.exists(path):
+        return die(f"Model '{model_name}' is not downloaded.", 2)
+    try:
+        shutil.rmtree(path)
+    except Exception as e:
+        return die(f"Failed to delete model '{model_name}': {e}", 2)
+    print(f"Deleted cached model: {model_name}")
+    return 0
+
+
 # ============================================================
 # CLI
 # ============================================================
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Local SRT/VTT generator (faster-whisper + ffmpeg)")
-    ap.add_argument("inputs", nargs="+", help="Media file(s), directory, or glob pattern(s)")
+    ap.add_argument("inputs", nargs="*", help="Media file(s), directory, or glob pattern(s)")
     ap.add_argument("--glob", default=None, help="Additional glob pattern to include (optional)")
     ap.add_argument("--outdir", default=None, help="Output directory (batch mode). If omitted, writes next to input.")
     ap.add_argument("--keep-structure", action="store_true", help="When using --outdir, preserve directory structure.")
@@ -1025,7 +1366,7 @@ def main() -> int:
 
     ap.add_argument("-o", "--output", default=None, help="Single-file output path (only valid when one input expands to one file).")
 
-    ap.add_argument("--format", choices=["srt", "vtt", "txt", "json"], default="srt", help="Primary output format")
+    ap.add_argument("--format", choices=["srt", "vtt", "ass", "txt", "json"], default="srt", help="Primary output format")
     ap.add_argument("--emit-transcript", default=None, help="Also write a transcript TXT to this path (or outdir-based if a directory).")
     ap.add_argument("--emit-segments", default=None, help="Also write segments JSON to this path (or outdir-based if a directory).")
     ap.add_argument("--emit-bundle", default=None, help="Also write a full JSON bundle (segments+subs+config) to this path (or outdir-based if a directory).")
@@ -1034,7 +1375,12 @@ def main() -> int:
     ap.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto", help="auto/cpu/cuda")
     ap.add_argument("--strict-cuda", action="store_true", help="If set, fail instead of falling back when CUDA init fails.")
     ap.add_argument("--language", default=None, help="Optional language code (e.g., en). If omitted, auto-detect.")
-    ap.add_argument("--word-timestamps", action="store_true", help="Request word timestamps (preserved in JSON outputs).")
+    ap.add_argument(
+        "--word-timestamps",
+        action="store_true",
+        help="Request word timestamps (preserved in JSON outputs).",
+    )
+    ap.add_argument("--word-level", action="store_true", help="Output word-level subtitle cues (requires word timestamps).")
 
     ap.add_argument("--mode", default=None, help="Preset modes: shorts | yt | podcast (aliases: short, youtube, pod).")
     ap.add_argument("--config", default=None, help="JSON config file. CLI args override config.")
@@ -1052,10 +1398,17 @@ def main() -> int:
 
     ap.add_argument("--min-gap", type=float, default=None, help="Minimum gap between consecutive subtitle cues (seconds).")
     ap.add_argument("--pad", type=float, default=None, help="Pad cues into silence where possible (seconds).")
+    ap.add_argument("--no-silence-split", action="store_true", help="Disable silence-based splitting/alignment.")
+    ap.add_argument("--silence-min-dur", type=float, default=None, help="Minimum silence duration for splits (seconds).")
+    ap.add_argument("--silence-threshold", type=float, default=None, help="Silence threshold in dB (e.g., -35).")
 
     ap.add_argument("--overwrite", action="store_true", help="Overwrite output if it exists")
     ap.add_argument("--keep_wav", action="store_true", help="Do not delete temporary WAV file")
     ap.add_argument("--tmpdir", default=None, help="Directory for temporary WAV (defaults to system temp)")
+
+    ap.add_argument("--list-models", action="store_true", help="List downloaded faster-whisper models and exit.")
+    ap.add_argument("--download-model", default=None, help="Download a faster-whisper model and exit.")
+    ap.add_argument("--delete-model", default=None, help="Delete a downloaded model from cache and exit.")
 
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--no-progress", action="store_true")
@@ -1074,6 +1427,30 @@ def main() -> int:
         diagnose()
         return 0
 
+    if args.list_models or args.download_model or args.delete_model:
+        if args.inputs:
+            return die("Model management options must be used without input files.", 2)
+        rc = 0
+        if args.list_models:
+            downloaded = list_downloaded_models()
+            if downloaded:
+                print("Downloaded models:")
+                for name, path in downloaded:
+                    print(f"  - {name}: {path}")
+            else:
+                print("No downloaded models found.")
+            print("Available models:")
+            print("  " + ", ".join(fw_utils.available_models()))
+        if args.download_model:
+            rc = download_model_cli(args.download_model)
+            if rc != 0:
+                return rc
+        if args.delete_model:
+            rc = delete_model_cli(args.delete_model)
+            if rc != 0:
+                return rc
+        return rc
+
     quiet = args.quiet
     show_progress = not args.no_progress
 
@@ -1088,6 +1465,8 @@ def main() -> int:
         args.mode = MODE_ALIASES[mode_key]
 
     # Expand inputs (files, dirs, globs)
+    if not args.inputs:
+        return die("No input files provided.", 2)
     files = expand_inputs(args.inputs, args.glob)
     files = [p for p in files if p.exists() and p.is_file()]
     if not files:
@@ -1149,7 +1528,16 @@ def main() -> int:
     if args.pad is not None:
         cfg.pad = float(args.pad)
 
+    if args.no_silence_split:
+        cfg.use_silence_split = False
+    if args.silence_min_dur is not None:
+        cfg.silence_min_dur = float(args.silence_min_dur)
+    if args.silence_threshold is not None:
+        cfg.silence_threshold_db = float(args.silence_threshold)
+
     if args.word_timestamps:
+        cfg.word_timestamps = True
+    if args.word_level or cfg.use_silence_split:
         cfg.word_timestamps = True
 
     # Basic dependency check

@@ -3,7 +3,10 @@
 *.mp4
 *.wav
 *.srt
+*.ass
 *.code-workspace
 
 build/
 *.egg-info/
+
+TODO

@@ -29,6 +29,8 @@ explored or tested, but they should be farely correct.
 - Progress indicators with segment-based timing
 - Supports batch processing of files
 - Works on Windows, macOS, and Linux
+- Output formats: SRT, VTT, ASS, TXT, JSON
+- Word-level cue output (optional)
 
 ## Requirements
 - **Python**: 3.10 or newer
@@ -116,6 +118,18 @@ Basic:
 srtgen input.mp4 -o output.srt
 ```
 
+ASS output:
+
+```bash
+srtgen input.mp4 --format ass
+```
+
+Word-level output:
+
+```bash
+srtgen input.mp4 --word-level
+```
+
 Preset modes:
 
 ```bash
@@ -142,8 +156,30 @@ srtgen input.mp4 --device cuda
 --target_cps 17
 --min_dur 1.0
 --max_dur 6.0
+--word-level
+--no-silence-split
 --overwrite
 --quiet
+```
+
+## Model Management
+
+List downloaded models:
+
+```bash
+srtgen --list-models
+```
+
+Download a model:
+
+```bash
+srtgen --download-model small
+```
+
+Delete a downloaded model:
+
+```bash
+srtgen --delete-model small
 ```
 
 ---
