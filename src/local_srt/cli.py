@@ -1328,6 +1328,10 @@ def list_downloaded_models() -> List[Tuple[str, str]]:
     return downloaded
 
 
+def list_available_models() -> List[str]:
+    return list(fw_utils.available_models())
+
+
 def download_model_cli(model_name: str) -> int:
     try:
         path = fw_utils.download_model(model_name, local_files_only=False)
@@ -1407,6 +1411,7 @@ def main() -> int:
     ap.add_argument("--tmpdir", default=None, help="Directory for temporary WAV (defaults to system temp)")
 
     ap.add_argument("--list-models", action="store_true", help="List downloaded faster-whisper models and exit.")
+    ap.add_argument("--list-available-models", action="store_true", help="List available faster-whisper model names and exit.")
     ap.add_argument("--download-model", default=None, help="Download a faster-whisper model and exit.")
     ap.add_argument("--delete-model", default=None, help="Delete a downloaded model from cache and exit.")
 
@@ -1427,7 +1432,7 @@ def main() -> int:
         diagnose()
         return 0
 
-    if args.list_models or args.download_model or args.delete_model:
+    if args.list_models or args.list_available_models or args.download_model or args.delete_model:
         if args.inputs:
             return die("Model management options must be used without input files.", 2)
         rc = 0
@@ -1440,7 +1445,10 @@ def main() -> int:
             else:
                 print("No downloaded models found.")
             print("Available models:")
-            print("  " + ", ".join(fw_utils.available_models()))
+            print("  " + ", ".join(list_available_models()))
+        if args.list_available_models and not args.list_models:
+            print("Available models:")
+            print("  " + ", ".join(list_available_models()))
         if args.download_model:
             rc = download_model_cli(args.download_model)
             if rc != 0:

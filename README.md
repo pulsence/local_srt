@@ -281,11 +281,13 @@ Model management (run without input files):
 
 ```bash
 --list-models
+--list-available-models
 --download-model NAME
 --delete-model NAME
 ```
 
 - `--list-models`: List downloaded models plus available model names.
+- `--list-available-models`: List available model names only.
 - `--download-model`: Download a model and exit.
 - `--delete-model`: Delete a downloaded model from cache and exit.
 
@@ -297,6 +299,12 @@ List downloaded models:
 
 ```bash
 srtgen --list-models
+```
+
+List available models:
+
+```bash
+srtgen --list-available-models
 ```
 
 Download a model:
