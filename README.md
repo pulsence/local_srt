@@ -146,21 +146,150 @@ srtgen input.mp4 --device cuda
 
 ---
 
-## Common Options
+## CLI Commands and Options
+
+Inputs:
 
 ```bash
---model small
---language en
---max_chars 42
---max_lines 2
---target_cps 17
---min_dur 1.0
---max_dur 6.0
---word-level
---no-silence-split
---overwrite
---quiet
+srtgen <inputs...>
 ```
+
+`<inputs...>` can be one or more files, directories, or glob patterns. Directories are scanned recursively
+for media files. You can also add an extra `--glob` pattern to widen a batch run.
+
+Output control:
+
+```bash
+--outdir PATH
+--keep-structure
+--root PATH
+-o, --output PATH
+--format srt|vtt|ass|txt|json
+--emit-transcript PATH
+--emit-segments PATH
+--emit-bundle PATH
+--overwrite
+```
+
+- `--outdir`: Write outputs into a directory (batch mode). Default is next to each input file.
+- `--keep-structure`: Preserve input directory structure under `--outdir`.
+- `--root`: Base root used with `--keep-structure` (defaults to common parent).
+- `-o/--output`: Single-file output path (only valid when one input expands to one file).
+- `--format`: Primary output file format.
+- `--emit-transcript`: Also write a plain-text transcript. If a directory is provided, a file is created per input.
+- `--emit-segments`: Also write segments JSON (word timestamps included if requested).
+- `--emit-bundle`: Also write a full JSON bundle (segments + subs + config).
+- `--overwrite`: Overwrite outputs if they already exist.
+
+Model + device:
+
+```bash
+--model tiny|base|small|medium|large-v3
+--device auto|cpu|cuda
+--strict-cuda
+--language CODE
+--word-timestamps
+--word-level
+```
+
+- `--model`: faster-whisper model name.
+- `--device`: `auto` picks CUDA when available, otherwise CPU.
+- `--strict-cuda`: Fail instead of falling back to CPU when CUDA init fails.
+- `--language`: Optional language code (e.g., `en`). If omitted, auto-detect.
+- `--word-timestamps`: Request word timestamps (stored in JSON outputs).
+- `--word-level`: Emit word-level subtitle cues (requires word timestamps).
+
+Preset + config:
+
+```bash
+--mode shorts|yt|podcast
+--config PATH
+--dry-run
+```
+
+- `--mode`: Apply a preset (`shorts`, `yt`, `podcast`).
+- `--config`: JSON config file. CLI args override config values.
+- `--dry-run`: Validate inputs and show resolved settings without transcribing.
+
+Chunking + timing:
+
+```bash
+--max_chars INT
+--max_lines INT
+--target_cps FLOAT
+--min_dur FLOAT
+--max_dur FLOAT
+--no-comma-split
+--no-medium-split
+--prefer-punct-splits
+--min-gap FLOAT
+--pad FLOAT
+--no-silence-split
+--silence-min-dur FLOAT
+--silence-threshold FLOAT
+```
+
+- `--max_chars`: Max characters per line.
+- `--max_lines`: Max lines per subtitle block.
+- `--target_cps`: Target characters per second for readability.
+- `--min_dur`: Minimum subtitle duration (seconds).
+- `--max_dur`: Maximum subtitle duration (seconds).
+- `--no-comma-split`: Avoid splitting on commas.
+- `--no-medium-split`: Avoid splitting on `;` or `:`.
+- `--prefer-punct-splits`: Prefer punctuation splits even when text already fits.
+- `--min-gap`: Minimum gap between consecutive cues (seconds).
+- `--pad`: Pad cues into silence where possible (seconds).
+- `--no-silence-split`: Disable silence-based splitting/alignment.
+- `--silence-min-dur`: Minimum silence duration for splits (seconds).
+- `--silence-threshold`: Silence threshold in dB (e.g., `-35`).
+
+Temp files:
+
+```bash
+--keep_wav
+--tmpdir PATH
+```
+
+- `--keep_wav`: Keep the temporary WAV file.
+- `--tmpdir`: Directory for temporary WAV files (defaults to system temp).
+
+Batch behavior + logging:
+
+```bash
+--continue-on-error
+--quiet
+--no-progress
+--debug
+```
+
+- `--continue-on-error`: In batch mode, keep processing files after errors.
+- `--quiet`: Minimal logging.
+- `--no-progress`: Disable progress output.
+- `--debug`: Show stack traces on errors.
+
+Version + diagnostics:
+
+```bash
+--version
+--diagnose
+```
+
+- `--version`: Print tool version and exit.
+- `--diagnose`: Print system dependency info and exit.
+
+Model management (run without input files):
+
+```bash
+--list-models
+--download-model NAME
+--delete-model NAME
+```
+
+- `--list-models`: List downloaded models plus available model names.
+- `--download-model`: Download a model and exit.
+- `--delete-model`: Delete a downloaded model from cache and exit.
+
+---
 
 ## Model Management
 
